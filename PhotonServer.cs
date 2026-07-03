@@ -29,6 +29,9 @@ namespace PhotonServer
 
         public bool InitDone;
         public bool Authenticated;
+        // Serialization protocol: detected from the first parameter-bearing message.
+        public bool V18;
+        public bool ProtocolKnown;
         public readonly DiffieHellman Dh = new();
 
         // Master vs game-server role for this connection. A fresh connection is a
@@ -396,18 +399,60 @@ namespace PhotonServer
                 full[0] = Wire.Magic;
                 full[1] = (byte)(rawType & 0x7F);
                 Array.Copy(plain, 0, full, 2, plain.Length);
-                var dmsg = GpBinary.ParseMessage(full);
+                var dmsg = ParseMessageDetect(peer, full);
                 LogV($"[{peer.EndPoint}] IN* {dmsg}   (decrypted {plain.Length}b)");
                 if (dmsg != null) DispatchMessage(peer, cmd, dmsg);
                 return;
             }
 
-            var msg = GpBinary.ParseMessage(payload);
+            var msg = ParseMessageDetect(peer, payload);
             if (msg == null) { Log($"[{peer.EndPoint}] unparsed msg: {Hex(payload, payload.Length)}"); return; }
 
             LogV($"[{peer.EndPoint}] IN  {msg}");
             DispatchMessage(peer, cmd, msg);
         }
+
+        // Parse an F3 message, auto-detecting GpBinaryV16 vs V18 from the first
+        // parameter-bearing message (the game uses V18, the probe uses V16).
+        private PhotonMessage? ParseMessageDetect(Peer peer, byte[] payload)
+        {
+            if (peer.ProtocolKnown)
+                return peer.V18 ? GpBinaryV18.ParseMessage(payload, out _) : GpBinary.ParseMessage(payload);
+
+            // Prefer V18 only if it consumes the payload exactly; else fall back
+            // to V16. Encrypted messages carry no body to detect from — skip.
+            byte raw = payload.Length >= 2 ? payload[1] : (byte)0;
+            if ((raw & 0x80) == 0 && (raw & 0x7F) != (byte)MsgType.Init)
+            {
+                try
+                {
+                    var m18 = GpBinaryV18.ParseMessage(payload, out int consumed);
+                    if (m18 != null && consumed == payload.Length && m18.Parameters.Count > 0)
+                    {
+                        peer.V18 = true; peer.ProtocolKnown = true;
+                        Log($"[{peer.EndPoint}] serialization protocol = GpBinaryV18");
+                        return m18;
+                    }
+                }
+                catch { /* not V18 */ }
+            }
+
+            var m16 = GpBinary.ParseMessage(payload);
+            if (m16 != null && m16.Parameters.Count > 0)
+            {
+                peer.V18 = false; peer.ProtocolKnown = true;
+                Log($"[{peer.EndPoint}] serialization protocol = GpBinaryV16");
+            }
+            return m16;
+        }
+
+        // Protocol-aware message builders (route to the peer's serializer).
+        private static byte[] BuildOpResp(Peer p, byte op, short ret, object? dbg, Dictionary<byte, object?>? pr)
+            => p.V18 ? GpBinaryV18.BuildOpResponse(op, ret, dbg, pr) : GpBinary.BuildOpResponse(op, ret, dbg, pr);
+        private static byte[] BuildEvt(Peer p, byte ev, Dictionary<byte, object?>? pr)
+            => p.V18 ? GpBinaryV18.BuildEvent(ev, pr) : GpBinary.BuildEvent(ev, pr);
+        private static byte[] BuildIntResp(Peer p, byte op, short ret, Dictionary<byte, object?>? pr)
+            => p.V18 ? GpBinaryV18.BuildInternalOpResponse(op, ret, pr) : GpBinary.BuildInternalOpResponse(op, ret, pr);
 
         private void DispatchMessage(Peer peer, PhotonCommand cmd, PhotonMessage msg)
         {
@@ -440,7 +485,7 @@ namespace PhotonServer
                 {
                     peer.Dh.DeriveShared(clientPub);
                     Log($"[{peer.EndPoint}]   DH exchange — shared key derived ({peer.Dh.SharedKey!.Length}b)");
-                    var resp = GpBinary.BuildInternalOpResponse(0, 0,
+                    var resp = BuildIntResp(peer, 0, 0,
                         new Dictionary<byte, object?> { [1] = peer.Dh.PublicKey });
                     SendReliableMessage(peer, cmd.Channel, resp);
                 }
@@ -466,7 +511,7 @@ namespace PhotonServer
                         aids != _config.RequireAppId)
                     {
                         SendReliableMessage(peer, cmd.Channel,
-                            GpBinary.BuildOpResponse(OpCode.Authenticate, 32755, "Invalid AppId", null));
+                            BuildOpResp(peer, OpCode.Authenticate, 32755, "Invalid AppId", null));
                         Log($"[{peer.EndPoint}]   AUTH rejected (AppId '{aids}')");
                         break;
                     }
@@ -475,7 +520,7 @@ namespace PhotonServer
                         avs != _config.RequireAppVersion)
                     {
                         SendReliableMessage(peer, cmd.Channel,
-                            GpBinary.BuildOpResponse(OpCode.Authenticate, 32755, "Invalid AppVersion", null));
+                            BuildOpResp(peer, OpCode.Authenticate, 32755, "Invalid AppVersion", null));
                         Log($"[{peer.EndPoint}]   AUTH rejected (AppVersion '{avs}')");
                         break;
                     }
@@ -507,7 +552,7 @@ namespace PhotonServer
                         Log($"[{peer.EndPoint}]   AUTH ok (MASTER mode, user {peer.UserId})");
                     }
 
-                    var resp = GpBinary.BuildOpResponse(OpCode.Authenticate, 0, null,
+                    var resp = BuildOpResp(peer, OpCode.Authenticate, 0, null,
                         new Dictionary<byte, object?>
                         {
                             [Param.Secret] = peer.SessionToken,
@@ -518,9 +563,9 @@ namespace PhotonServer
                 }
                 case OpCode.JoinLobby:
                 {
-                    var resp = GpBinary.BuildOpResponse(OpCode.JoinLobby, 0, null, null);
+                    var resp = BuildOpResp(peer, OpCode.JoinLobby, 0, null, null);
                     SendReliableMessage(peer, cmd.Channel, resp);
-                    SendReliableMessage(peer, cmd.Channel, BuildGameListEvent());
+                    SendReliableMessage(peer, cmd.Channel, BuildGameListEvent(peer));
                     Log($"[{peer.EndPoint}]   JOIN LOBBY ok ({_rooms.Count} room(s) listed)");
                     break;
                 }
@@ -552,7 +597,7 @@ namespace PhotonServer
                 sess.PendingRoom   = roomName;
                 sess.PendingCreate = isCreate;
             }
-            var resp = GpBinary.BuildOpResponse(opCode, 0, null, new Dictionary<byte, object?>
+            var resp = BuildOpResp(peer, opCode, 0, null, new Dictionary<byte, object?>
             {
                 [Param.Address] = _publicAddress,
                 [Param.Secret]  = peer.SessionToken,
@@ -574,14 +619,14 @@ namespace PhotonServer
             {
                 // Room exists → error (game already exists = 32766).
                 SendReliableMessage(peer, cmd.Channel,
-                    GpBinary.BuildOpResponse(OpCode.CreateGame, 32766, "Game already exists", null));
+                    BuildOpResp(peer, OpCode.CreateGame, 32766, "Game already exists", null));
                 Log($"[{peer.EndPoint}]   CREATE '{name}' FAILED (exists)");
                 return;
             }
             if (_config.MaxRooms > 0 && _rooms.Count >= _config.MaxRooms)
             {
                 SendReliableMessage(peer, cmd.Channel,
-                    GpBinary.BuildOpResponse(OpCode.CreateGame, 32760, "Server room limit reached", null));
+                    BuildOpResp(peer, OpCode.CreateGame, 32760, "Server room limit reached", null));
                 Log($"[{peer.EndPoint}]   CREATE '{name}' FAILED (server at {_config.MaxRooms} rooms)");
                 return;
             }
@@ -593,7 +638,7 @@ namespace PhotonServer
             // per-room cap.
             if (_config.MaxPeersPerRoom > 0 && room.MaxPlayers > _config.MaxPeersPerRoom)
             {
-                SendReliableMessage(peer, cmd.Channel, GpBinary.BuildOpResponse(OpCode.CreateGame, 32762,
+                SendReliableMessage(peer, cmd.Channel, BuildOpResp(peer, OpCode.CreateGame, 32762,
                     $"MaxPlayers {room.MaxPlayers} exceeds server limit {_config.MaxPeersPerRoom}", null));
                 Log($"[{peer.EndPoint}]   CREATE '{name}' FAILED (maxPlayers {room.MaxPlayers} > cap {_config.MaxPeersPerRoom})");
                 return;
@@ -625,7 +670,7 @@ namespace PhotonServer
                 {
                     // Game does not exist = 32758.
                     SendReliableMessage(peer, cmd.Channel,
-                        GpBinary.BuildOpResponse(OpCode.JoinGame, 32758, "Game does not exist", null));
+                        BuildOpResp(peer, OpCode.JoinGame, 32758, "Game does not exist", null));
                     Log($"[{peer.EndPoint}]   JOIN '{name}' FAILED (missing)");
                     return;
                 }
@@ -633,13 +678,13 @@ namespace PhotonServer
             if (!room.IsOpen)
             {
                 SendReliableMessage(peer, cmd.Channel,
-                    GpBinary.BuildOpResponse(OpCode.JoinGame, 32764, "Game closed", null));
+                    BuildOpResp(peer, OpCode.JoinGame, 32764, "Game closed", null));
                 return;
             }
             if (RoomIsFull(room))
             {
                 SendReliableMessage(peer, cmd.Channel,
-                    GpBinary.BuildOpResponse(OpCode.JoinGame, 32765, "Game full", null));
+                    BuildOpResp(peer, OpCode.JoinGame, 32765, "Game full", null));
                 Log($"[{peer.EndPoint}]   JOIN '{name}' FAILED (full)");
                 return;
             }
@@ -657,7 +702,7 @@ namespace PhotonServer
                 if (pick == null)
                 {
                     SendReliableMessage(peer, cmd.Channel,
-                        GpBinary.BuildOpResponse(OpCode.JoinRandomGame, 32760, "No match found", null));
+                        BuildOpResp(peer, OpCode.JoinRandomGame, 32760, "No match found", null));
                     return;
                 }
                 RedirectIfMaster(peer, cmd, OpCode.JoinRandomGame, pick.Name, isCreate: false);
@@ -728,36 +773,34 @@ namespace PhotonServer
                 [Param.GameProperties]   = ToDict(room.Properties),
                 [Param.RoomFlags]        = (int)flags,
             };
-            SendReliableMessage(peer, 0, GpBinary.BuildOpResponse(opCode, 0, null, respParams));
+            SendReliableMessage(peer, 0, BuildOpResp(peer, opCode, 0, null, respParams));
 
             // Replay cached events (buffered Instantiates etc.) so the joiner
             // reconstructs existing room state.
             foreach (var ce in room.EventCache)
             {
-                var evt = GpBinary.BuildEvent(ce.Code, new Dictionary<byte, object?>
+                SendReliableMessage(peer, 0, BuildEvt(peer, ce.Code, new Dictionary<byte, object?>
                 {
                     [Param.Data]    = ce.Data,
                     [Param.ActorNr] = ce.Sender,
-                });
-                SendReliableMessage(peer, 0, evt);
+                }));
             }
             if (room.EventCache.Count > 0)
                 LogV($"[{peer.EndPoint}]   replayed {room.EventCache.Count} cached event(s)");
 
             // Notify existing members that an actor joined/rejoined (Event 255).
-            var joinEvent = GpBinary.BuildEvent(EvCode.Join, new Dictionary<byte, object?>
+            BroadcastEvent(room, EvCode.Join, new Dictionary<byte, object?>
             {
                 [Param.ActorNr]          = actorNr,
                 [Param.ActorList]        = room.ActorNumbers,
                 [Param.PlayerProperties] = ToDict(peer.PlayerProperties),
-            });
-            BroadcastEvent(room, joinEvent, exceptActor: actorNr);
+            }, exceptActor: actorNr);
             if (rejoin) Log($"[{peer.EndPoint}]   REJOINED as actor {actorNr}");
         }
 
         private void HandleLeaveOp(Peer peer, PhotonCommand cmd, PhotonMessage msg)
         {
-            SendReliableMessage(peer, cmd.Channel, GpBinary.BuildOpResponse(OpCode.Leave, 0, null, null));
+            SendReliableMessage(peer, cmd.Channel, BuildOpResp(peer, OpCode.Leave, 0, null, null));
             // The client can request to become inactive (willComeBack) via [233].
             bool wantsInactive = msg.Parameters.TryGetValue(Param.IsInactive, out var iv) && iv is bool b && b;
             LeaveRoom(peer, wantsInactive);
@@ -791,14 +834,13 @@ namespace PhotonServer
             peer.Room = null;
             peer.ActorNr = 0;
 
-            var leaveEvent = GpBinary.BuildEvent(EvCode.Leave, new Dictionary<byte, object?>
+            BroadcastEvent(room, EvCode.Leave, new Dictionary<byte, object?>
             {
                 [Param.ActorNr]        = actorNr,
                 [Param.ActorList]      = room.ActorNumbers,
                 [Param.MasterClientId] = room.MasterClientActor,
                 [Param.IsInactive]     = goInactive,
             });
-            BroadcastEvent(room, leaveEvent);
             Log($"[{peer.EndPoint}]   {(goInactive ? "INACTIVE in" : "LEFT")} room '{room.Name}' " +
                 $"(actor {actorNr}); {room.PlayerCount} member(s)");
 
@@ -824,14 +866,13 @@ namespace PhotonServer
                     room.RemoveMember(actorNr);
                     if (room.CleanupCacheOnLeave)
                         room.EventCache.RemoveAll(ce => ce.Sender == actorNr && !ce.Global);
-                    var leaveEvent = GpBinary.BuildEvent(EvCode.Leave, new Dictionary<byte, object?>
+                    BroadcastEvent(room, EvCode.Leave, new Dictionary<byte, object?>
                     {
                         [Param.ActorNr]        = actorNr,
                         [Param.ActorList]      = room.ActorNumbers,
                         [Param.MasterClientId] = room.MasterClientActor,
                         [Param.IsInactive]     = false,
                     });
-                    BroadcastEvent(room, leaveEvent);
                     Log($"[Server]   inactive actor {actorNr} in '{room.Name}' TTL-expired → removed");
                 }
                 if (room.PlayerCount == 0)
@@ -895,28 +936,27 @@ namespace PhotonServer
                 [Param.Data]    = data,
                 [Param.ActorNr] = peer.ActorNr,
             };
-            byte[] evBytes = GpBinary.BuildEvent(evCode, evParams);
 
             // Explicit target actor list overrides the receiver group.
             if (msg.Parameters.TryGetValue(Param.ActorList, out var tl) && tl is object?[] targets)
             {
                 foreach (var t in targets)
                     if (t is int ta && room.Members.TryGetValue(ta, out var m) && !m.IsInactive && m.Peer != null)
-                        SendReliableMessage(m.Peer, 0, evBytes);
+                        SendReliableMessage(m.Peer, 0, BuildEvt(m.Peer, evCode, evParams));
             }
             else
             {
                 switch (group)
                 {
                     case ReceiverGroup.All:
-                        BroadcastEvent(room, evBytes);
+                        BroadcastEvent(room, evCode, evParams);
                         break;
                     case ReceiverGroup.Master:
-                        if (room.Members.TryGetValue(room.MasterClientActor, out var mc))
-                            SendReliableMessage(mc.Peer, 0, evBytes);
+                        if (room.Members.TryGetValue(room.MasterClientActor, out var mc) && mc.Peer != null)
+                            SendReliableMessage(mc.Peer, 0, BuildEvt(mc.Peer, evCode, evParams));
                         break;
                     default: // Others
-                        BroadcastEvent(room, evBytes, exceptActor: peer.ActorNr);
+                        BroadcastEvent(room, evCode, evParams, exceptActor: peer.ActorNr);
                         break;
                 }
             }
@@ -941,16 +981,15 @@ namespace PhotonServer
                 foreach (var kv in changed) m.Properties[kv.Key] = kv.Value;
             }
 
-            SendReliableMessage(peer, cmd.Channel, GpBinary.BuildOpResponse(OpCode.SetProperties, 0, null, null));
+            SendReliableMessage(peer, cmd.Channel, BuildOpResp(peer, OpCode.SetProperties, 0, null, null));
 
             // Broadcast the change to everyone (Event 253).
-            var evt = GpBinary.BuildEvent(EvCode.PropertiesChanged, new Dictionary<byte, object?>
+            BroadcastEvent(room, EvCode.PropertiesChanged, new Dictionary<byte, object?>
             {
                 [Param.Properties]    = changed,
                 [Param.TargetActorNr] = target,
                 [Param.ActorNr]       = peer.ActorNr,
-            });
-            BroadcastEvent(room, evt, exceptActor: peer.ActorNr);
+            }, exceptActor: peer.ActorNr);
             Log($"[{peer.EndPoint}]   SETPROPS target={(target == 0 ? "room" : target.ToString())} → broadcast");
         }
 
@@ -987,7 +1026,7 @@ namespace PhotonServer
                 room.CleanupCacheOnLeave = (Convert.ToInt32(rf) & 0x02) != 0;
         }
 
-        private byte[] BuildGameListEvent()
+        private byte[] BuildGameListEvent(Peer peer)
         {
             var list = new Dictionary<object, object?>();
             foreach (var room in _rooms.Values)
@@ -1001,7 +1040,7 @@ namespace PhotonServer
                     [(byte)252] = room.IsVisible,              // is visible
                 };
             }
-            return GpBinary.BuildEvent(EvCode.GameList, new Dictionary<byte, object?> { [222] = list });
+            return BuildEvt(peer, EvCode.GameList, new Dictionary<byte, object?> { [222] = list });
         }
 
         private static Dictionary<object, object?> ToDict(Dictionary<object, object?> src)
@@ -1114,13 +1153,14 @@ namespace PhotonServer
         }
 
         // Send an event to every active member of a room (optionally excluding one
-        // actor). Inactive members have no live peer and are skipped.
-        private void BroadcastEvent(Room room, byte[] eventPayload, int exceptActor = 0)
+        // actor). The event is serialized per-recipient so mixed-protocol rooms
+        // (V16 + V18) are handled correctly. Inactive members are skipped.
+        private void BroadcastEvent(Room room, byte eventCode, Dictionary<byte, object?> evParams, int exceptActor = 0)
         {
             foreach (var m in room.Members.Values)
             {
                 if (m.ActorNr == exceptActor || m.IsInactive || m.Peer == null) continue;
-                SendReliableMessage(m.Peer, 0, eventPayload);
+                SendReliableMessage(m.Peer, 0, BuildEvt(m.Peer, eventCode, evParams));
             }
         }
 

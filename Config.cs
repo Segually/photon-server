@@ -35,8 +35,13 @@ namespace PhotonServer
         public string? RequireAppVersion { get; set; } = null;
 
         /// <summary>Drop a peer (and remove it from its room) after this many
-        /// milliseconds without any inbound packet. -1 disables timeout sweeps.</summary>
-        public int PeerTimeoutMs { get; set; } = 15000;
+        /// milliseconds without any inbound packet. Default 5 minutes so a briefly
+        /// stalled/backgrounded client is not kicked. -1 disables timeout sweeps.</summary>
+        public int PeerTimeoutMs { get; set; } = 300000;
+
+        /// <summary>Region code advertised to clients (shown in the game's UI).
+        /// Empty = auto-detect from the server's public IP geolocation.</summary>
+        public string Region { get; set; } = "";
 
         /// <summary>Log every decoded operation/event. Disable for quieter,
         /// higher-throughput hosting.</summary>

@@ -170,6 +170,56 @@ namespace PhotonServer
                     for (uint i = 0; i < n; i++) arr[i] = ReadString(b, ref o);
                     return arr;
                 }
+                case TFloatArray:
+                {
+                    uint n = ReadCompressedUInt32(b, ref o);
+                    var arr = new float[n];
+                    for (uint i = 0; i < n; i++) { arr[i] = BitConverter.ToSingle(b, o); o += 4; }
+                    return arr;
+                }
+                case TDoubleArray:
+                {
+                    uint n = ReadCompressedUInt32(b, ref o);
+                    var arr = new double[n];
+                    for (uint i = 0; i < n; i++) { arr[i] = BitConverter.ToDouble(b, o); o += 8; }
+                    return arr;
+                }
+                case TShortArray:
+                {
+                    uint n = ReadCompressedUInt32(b, ref o);
+                    var arr = new short[n];
+                    for (uint i = 0; i < n; i++) arr[i] = ReadInt16(b, ref o);
+                    return arr;
+                }
+                case TLongArray:
+                {
+                    uint n = ReadCompressedUInt32(b, ref o);
+                    var arr = new long[n];
+                    for (uint i = 0; i < n; i++) arr[i] = ReadZigZag64(b, ref o);
+                    return arr;
+                }
+                case TBoolArray:
+                {
+                    uint n = ReadCompressedUInt32(b, ref o);
+                    var arr = new bool[n];
+                    int nbytes = (int)((n + 7) / 8);
+                    for (int i = 0; i < n; i++) arr[i] = ((b[o + i / 8] >> (i % 8)) & 1) != 0; // LSB-first
+                    o += nbytes;
+                    return arr;
+                }
+                case TDictionary:
+                {
+                    byte kt = b[o++], vt = b[o++];
+                    uint n = ReadCompressedUInt32(b, ref o);
+                    var d = new Dictionary<object, object?>();
+                    for (uint i = 0; i < n; i++)
+                    {
+                        var k = kt == 0 ? ReadValue(b, ref o) : ReadTyped(b, ref o, kt);
+                        var v = vt == 0 ? ReadValue(b, ref o) : ReadTyped(b, ref o, vt);
+                        if (k != null) d[k] = v;
+                    }
+                    return d;
+                }
                 default:
                     throw new NotSupportedException($"V18 GpType 0x{t:X2} not supported");
             }
@@ -302,6 +352,31 @@ namespace PhotonServer
                 case int[] ia:
                     s.WriteByte(TIntArray); WriteCompressedUInt32(s, (uint)ia.Length);
                     foreach (var x in ia) WriteZigZag32(s, x);
+                    break;
+                case float[] fa:
+                    s.WriteByte(TFloatArray); WriteCompressedUInt32(s, (uint)fa.Length);
+                    foreach (var x in fa) s.Write(BitConverter.GetBytes(x), 0, 4);
+                    break;
+                case double[] da2:
+                    s.WriteByte(TDoubleArray); WriteCompressedUInt32(s, (uint)da2.Length);
+                    foreach (var x in da2) s.Write(BitConverter.GetBytes(x), 0, 8);
+                    break;
+                case short[] sa2:
+                    s.WriteByte(TShortArray); WriteCompressedUInt32(s, (uint)sa2.Length);
+                    foreach (var x in sa2) { s.WriteByte((byte)x); s.WriteByte((byte)(x >> 8)); }
+                    break;
+                case long[] la:
+                    s.WriteByte(TLongArray); WriteCompressedUInt32(s, (uint)la.Length);
+                    foreach (var x in la) WriteZigZag64(s, x);
+                    break;
+                case bool[] boa:
+                    s.WriteByte(TBoolArray); WriteCompressedUInt32(s, (uint)boa.Length);
+                    for (int i = 0; i < boa.Length; i += 8)
+                    {
+                        byte packed = 0;
+                        for (int k = 0; k < 8 && i + k < boa.Length; k++) if (boa[i + k]) packed |= (byte)(1 << k);
+                        s.WriteByte(packed);
+                    }
                     break;
                 case string[] sa:
                     s.WriteByte(TStringArray); WriteCompressedUInt32(s, (uint)sa.Length);

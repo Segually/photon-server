@@ -399,17 +399,33 @@ namespace PhotonServer
                 full[0] = Wire.Magic;
                 full[1] = (byte)(rawType & 0x7F);
                 Array.Copy(plain, 0, full, 2, plain.Length);
-                var dmsg = ParseMessageDetect(peer, full);
-                LogV($"[{peer.EndPoint}] IN* {dmsg}   (decrypted {plain.Length}b)");
-                if (dmsg != null) DispatchMessage(peer, cmd, dmsg);
+                try
+                {
+                    var dmsg = ParseMessageDetect(peer, full);
+                    LogV($"[{peer.EndPoint}] IN* {dmsg}   (decrypted {plain.Length}b)");
+                    if (dmsg != null) DispatchMessage(peer, cmd, dmsg);
+                }
+                catch (Exception e) { LogParseFail(peer, full, e); }
                 return;
             }
 
-            var msg = ParseMessageDetect(peer, payload);
-            if (msg == null) { Log($"[{peer.EndPoint}] unparsed msg: {Hex(payload, payload.Length)}"); return; }
+            try
+            {
+                var msg = ParseMessageDetect(peer, payload);
+                if (msg == null) { Log($"[{peer.EndPoint}] unparsed msg: {Hex(payload, payload.Length)}"); return; }
+                LogV($"[{peer.EndPoint}] IN  {msg}");
+                DispatchMessage(peer, cmd, msg);
+            }
+            catch (Exception e) { LogParseFail(peer, payload, e); }
+        }
 
-            LogV($"[{peer.EndPoint}] IN  {msg}");
-            DispatchMessage(peer, cmd, msg);
+        // Log the exact bytes when a message fails to parse/dispatch, so any
+        // remaining serialization gap is immediately diagnosable.
+        private void LogParseFail(Peer peer, byte[] payload, Exception e)
+        {
+            string proto = peer.ProtocolKnown ? (peer.V18 ? "V18" : "V16") : "?";
+            Log($"[{peer.EndPoint}] PARSE FAIL ({proto}) type=0x{(payload.Length > 1 ? payload[1] : 0):X2} " +
+                $"{e.Message}  ({payload.Length}b) hex={Hex(payload, Math.Min(payload.Length, 160))}");
         }
 
         // Parse an F3 message, auto-detecting GpBinaryV16 vs V18 from the first

@@ -41,9 +41,21 @@ namespace PhotonServer
         public long    LastRecvMs;   // for idle-timeout sweeps
 
         // Room membership.
-        public Room? Room;
-        public int   ActorNr;
+        public Room?   Room;
+        public int     ActorNr;
+        public string? UserId;
         public readonly Dictionary<object, object?> PlayerProperties = new();
+
+        // Inbound fragment reassembly, keyed by the fragment start sequence.
+        public sealed class FragmentAssembly
+        {
+            public byte[] Buffer = Array.Empty<byte>();
+            public int    Total;
+            public int    Count;
+            public int    Received;
+            public byte   Channel;
+        }
+        public readonly Dictionary<int, FragmentAssembly> Fragments = new();
 
         // Inbound reliable commands are delivered at-least-once (client retransmits
         // until ACKed). Track processed (channel, seq) so each is handled exactly once.
@@ -97,6 +109,7 @@ namespace PhotonServer
             public string? PendingRoom;
             public bool    PendingCreate;
             public long    CreatedMs;
+            public string? UserId;
         }
 
         // Remove a peer's session unless a redirect is still pending on the master
@@ -187,6 +200,8 @@ namespace PhotonServer
                                      now - s.Value.CreatedMs > 30000).ToList())
                             _sessions.Remove(kv.Key);
 
+                        SweepInactiveActors(now);
+
                         foreach (var peer in _peers.Values.ToList())
                         {
                             // Idle-timeout sweep: drop peers that have gone silent
@@ -194,7 +209,7 @@ namespace PhotonServer
                             if (_config.PeerTimeoutMs > 0 && now - peer.LastRecvMs > _config.PeerTimeoutMs)
                             {
                                 Log($"[{peer.EndPoint}] idle timeout ({now - peer.LastRecvMs}ms) — dropping");
-                                LeaveRoom(peer, becameInactive: false);
+                                LeaveRoom(peer, willComeBack: true);
                                 _peers.Remove(peer.EndPoint);
                                 CleanupSession(peer);
                                 continue;
@@ -256,7 +271,9 @@ namespace PhotonServer
                         Log($"[{from}] DISCONNECT");
                         if (peer != null)
                         {
-                            LeaveRoom(peer, becameInactive: false);
+                            // A clean disconnect may still leave an inactive actor
+                            // if the room has a PlayerTtl (the client can rejoin).
+                            LeaveRoom(peer, willComeBack: true);
                             _peers.Remove(from);
                             CleanupSession(peer);
                         }
@@ -270,6 +287,11 @@ namespace PhotonServer
                         if (cmd.IsReliable && !peer.MarkProcessed(cmd.Channel, cmd.ReliableSeq))
                             break;
                         HandleMessage(peer, cmd);
+                        break;
+                    case CommandType.SendFragment:
+                        if (peer == null) break;
+                        if (!peer.MarkProcessed(cmd.Channel, cmd.ReliableSeq)) break; // dup fragment
+                        HandleFragment(peer, cmd);
                         break;
                     default:
                         LogV($"[{from}] control command {(byte)cmd.Type} ch{cmd.Channel} seq{cmd.ReliableSeq} (acked)");
@@ -291,6 +313,47 @@ namespace PhotonServer
             var verify = BuildVerifyConnect(peer, cmd);
             SendPacket(peer, new[] { ack, verify });
             return peer;
+        }
+
+        // ── Fragment reassembly ──────────────────────────────────────────────
+        private void HandleFragment(Peer peer, PhotonCommand cmd)
+        {
+            if (!peer.Fragments.TryGetValue(cmd.FragStartSeq, out var asm))
+            {
+                if (cmd.FragTotalLength < 0 || cmd.FragTotalLength > 8 * 1024 * 1024)
+                {
+                    Log($"[{peer.EndPoint}] fragment with bad total length {cmd.FragTotalLength}");
+                    return;
+                }
+                asm = new Peer.FragmentAssembly
+                {
+                    Buffer  = new byte[cmd.FragTotalLength],
+                    Total   = cmd.FragTotalLength,
+                    Count   = cmd.FragCount,
+                    Channel = cmd.Channel,
+                };
+                peer.Fragments[cmd.FragStartSeq] = asm;
+            }
+
+            if (cmd.FragOffset >= 0 && cmd.FragOffset + cmd.Payload.Length <= asm.Buffer.Length)
+            {
+                Array.Copy(cmd.Payload, 0, asm.Buffer, cmd.FragOffset, cmd.Payload.Length);
+                asm.Received++;
+            }
+
+            if (asm.Received >= asm.Count)
+            {
+                peer.Fragments.Remove(cmd.FragStartSeq);
+                LogV($"[{peer.EndPoint}] fragment complete: {asm.Total}b in {asm.Count} parts");
+                var synthetic = new PhotonCommand
+                {
+                    Type = CommandType.SendReliable,
+                    Channel = asm.Channel,
+                    Payload = asm.Buffer,
+                    ReliableSeq = cmd.FragStartSeq,
+                };
+                HandleMessage(peer, synthetic);
+            }
         }
 
         // ── Message (F3) handling ────────────────────────────────────────────
@@ -416,6 +479,11 @@ namespace PhotonServer
 
                     peer.Authenticated = true;
 
+                    // A client-supplied UserId (param 225) enables rejoin across
+                    // reconnects; otherwise assign a stable one.
+                    string? clientUserId = msg.Parameters.TryGetValue(Param.UserId, out var uid) && uid is string uids && uids.Length > 0
+                        ? uids : null;
+
                     // A token in [221] means the client is returning after a
                     // create/join redirect — resume that session in game mode.
                     string? inToken = msg.Parameters.TryGetValue(Param.Secret, out var sv) && sv is string ss ? ss : null;
@@ -425,20 +493,22 @@ namespace PhotonServer
                         peer.GameMode      = true;
                         peer.PendingRoom   = sess.PendingRoom;
                         peer.PendingCreate = sess.PendingCreate;
-                        Log($"[{peer.EndPoint}]   AUTH ok (GAME mode, pending room '{sess.PendingRoom}')");
+                        peer.UserId        = clientUserId ?? sess.UserId ?? Guid.NewGuid().ToString();
+                        Log($"[{peer.EndPoint}]   AUTH ok (GAME mode, pending room '{sess.PendingRoom}', user {peer.UserId})");
                     }
                     else
                     {
+                        peer.UserId       = clientUserId ?? Guid.NewGuid().ToString();
                         peer.SessionToken = Guid.NewGuid().ToString("N");
-                        _sessions[peer.SessionToken] = new Session { CreatedMs = NowMs };
-                        Log($"[{peer.EndPoint}]   AUTH ok (MASTER mode)");
+                        _sessions[peer.SessionToken] = new Session { CreatedMs = NowMs, UserId = peer.UserId };
+                        Log($"[{peer.EndPoint}]   AUTH ok (MASTER mode, user {peer.UserId})");
                     }
 
                     var resp = GpBinary.BuildOpResponse(OpCode.Authenticate, 0, null,
                         new Dictionary<byte, object?>
                         {
                             [Param.Secret] = peer.SessionToken,
-                            [Param.UserId] = Guid.NewGuid().ToString(),
+                            [Param.UserId] = peer.UserId,
                         });
                     SendReliableMessage(peer, cmd.Channel, resp);
                     break;
@@ -456,7 +526,7 @@ namespace PhotonServer
                 case OpCode.JoinRandomGame: HandleJoinRandom(peer, cmd, msg); break;
                 case OpCode.RaiseEvent:  HandleRaiseEvent(peer, cmd, msg); break;
                 case OpCode.SetProperties: HandleSetProperties(peer, cmd, msg); break;
-                case OpCode.Leave:       HandleLeaveOp(peer, cmd); break;
+                case OpCode.Leave:       HandleLeaveOp(peer, cmd, msg); break;
                 case OpCode.ChangeGroups:
                     // Interest groups — accept silently.
                     break;
@@ -515,6 +585,17 @@ namespace PhotonServer
 
             var room = new Room(name);
             ApplyRoomOptions(room, msg);
+
+            // Reject creation if the requested MaxPlayers exceeds the server's
+            // per-room cap.
+            if (_config.MaxPeersPerRoom > 0 && room.MaxPlayers > _config.MaxPeersPerRoom)
+            {
+                SendReliableMessage(peer, cmd.Channel, GpBinary.BuildOpResponse(OpCode.CreateGame, 32762,
+                    $"MaxPlayers {room.MaxPlayers} exceeds server limit {_config.MaxPeersPerRoom}", null));
+                Log($"[{peer.EndPoint}]   CREATE '{name}' FAILED (maxPlayers {room.MaxPlayers} > cap {_config.MaxPeersPerRoom})");
+                return;
+            }
+
             _rooms[name] = room;
             EnterRoom(peer, room, msg, OpCode.CreateGame);
             Log($"[{peer.EndPoint}]   CREATE '{name}' ok (actor {peer.ActorNr}, master)");
@@ -598,11 +679,27 @@ namespace PhotonServer
                 foreach (var kv in props) peer.PlayerProperties[kv.Key] = kv.Value;
             }
 
-            int actorNr = room.AddMember(peer);
+            // Rejoin: an inactive actor with the same UserId reclaims its slot and
+            // actor number; otherwise a new actor is allocated.
+            var existing = room.FindInactiveByUserId(peer.UserId);
+            int actorNr;
+            bool rejoin = existing != null;
+            if (existing != null)
+            {
+                existing.IsInactive = false;
+                existing.Peer = peer;
+                actorNr = existing.ActorNr;
+                room.RecomputeMaster();
+            }
+            else
+            {
+                actorNr = room.AddMember(peer, peer.UserId);
+            }
             peer.Room = room;
             peer.ActorNr = actorNr;
-            room.Members[actorNr].Properties.Clear();
-            foreach (var kv in peer.PlayerProperties) room.Members[actorNr].Properties[kv.Key] = kv.Value;
+            var self = room.Members[actorNr];
+            self.Properties.Clear();
+            foreach (var kv in peer.PlayerProperties) self.Properties[kv.Key] = kv.Value;
 
             // Build enter-room response: your actor number, all players' props, room props.
             var allPlayers = new Dictionary<object, object?>();
@@ -630,7 +727,21 @@ namespace PhotonServer
             };
             SendReliableMessage(peer, 0, GpBinary.BuildOpResponse(opCode, 0, null, respParams));
 
-            // Notify existing members that a new actor joined (Event 255).
+            // Replay cached events (buffered Instantiates etc.) so the joiner
+            // reconstructs existing room state.
+            foreach (var ce in room.EventCache)
+            {
+                var evt = GpBinary.BuildEvent(ce.Code, new Dictionary<byte, object?>
+                {
+                    [Param.Data]    = ce.Data,
+                    [Param.ActorNr] = ce.Sender,
+                });
+                SendReliableMessage(peer, 0, evt);
+            }
+            if (room.EventCache.Count > 0)
+                LogV($"[{peer.EndPoint}]   replayed {room.EventCache.Count} cached event(s)");
+
+            // Notify existing members that an actor joined/rejoined (Event 255).
             var joinEvent = GpBinary.BuildEvent(EvCode.Join, new Dictionary<byte, object?>
             {
                 [Param.ActorNr]          = actorNr,
@@ -638,20 +749,42 @@ namespace PhotonServer
                 [Param.PlayerProperties] = ToDict(peer.PlayerProperties),
             });
             BroadcastEvent(room, joinEvent, exceptActor: actorNr);
+            if (rejoin) Log($"[{peer.EndPoint}]   REJOINED as actor {actorNr}");
         }
 
-        private void HandleLeaveOp(Peer peer, PhotonCommand cmd)
+        private void HandleLeaveOp(Peer peer, PhotonCommand cmd, PhotonMessage msg)
         {
             SendReliableMessage(peer, cmd.Channel, GpBinary.BuildOpResponse(OpCode.Leave, 0, null, null));
-            LeaveRoom(peer, becameInactive: false);
+            // The client can request to become inactive (willComeBack) via [233].
+            bool wantsInactive = msg.Parameters.TryGetValue(Param.IsInactive, out var iv) && iv is bool b && b;
+            LeaveRoom(peer, wantsInactive);
         }
 
-        private void LeaveRoom(Peer peer, bool becameInactive)
+        // Remove a peer from its room. When willComeBack is true and the room has a
+        // PlayerTtl, the actor is kept as inactive so it can rejoin; otherwise it is
+        // removed and its non-global cached events are pruned.
+        private void LeaveRoom(Peer peer, bool willComeBack)
         {
             var room = peer.Room;
             if (room == null) return;
             int actorNr = peer.ActorNr;
-            room.RemoveMember(actorNr);
+
+            bool goInactive = willComeBack && room.PlayerTtl != 0 && room.Members.ContainsKey(actorNr);
+            if (goInactive)
+            {
+                var m = room.Members[actorNr];
+                m.IsInactive    = true;
+                m.DeactivatedMs = NowMs;
+                m.Peer          = null!;
+                room.RecomputeMaster();
+            }
+            else
+            {
+                room.RemoveMember(actorNr);
+                if (room.CleanupCacheOnLeave)
+                    room.EventCache.RemoveAll(ce => ce.Sender == actorNr && !ce.Global);
+            }
+
             peer.Room = null;
             peer.ActorNr = 0;
 
@@ -660,16 +793,69 @@ namespace PhotonServer
                 [Param.ActorNr]        = actorNr,
                 [Param.ActorList]      = room.ActorNumbers,
                 [Param.MasterClientId] = room.MasterClientActor,
-                [Param.IsInactive]     = becameInactive,
+                [Param.IsInactive]     = goInactive,
             });
             BroadcastEvent(room, leaveEvent);
-            Log($"[{peer.EndPoint}]   LEFT room '{room.Name}' (actor {actorNr}); {room.PlayerCount} remain");
+            Log($"[{peer.EndPoint}]   {(goInactive ? "INACTIVE in" : "LEFT")} room '{room.Name}' " +
+                $"(actor {actorNr}); {room.PlayerCount} member(s)");
 
             if (room.PlayerCount == 0)
             {
                 _rooms.Remove(room.Name);
                 Log($"[Server]   room '{room.Name}' empty → removed");
             }
+        }
+
+        // Remove inactive actors whose PlayerTtl has elapsed, broadcasting a final
+        // (permanent) Leave for each. PlayerTtl <= 0 means never expire.
+        private void SweepInactiveActors(long now)
+        {
+            foreach (var room in _rooms.Values.ToList())
+            {
+                if (room.PlayerTtl <= 0) continue;
+                var expired = room.Members.Values
+                    .Where(m => m.IsInactive && now - m.DeactivatedMs > room.PlayerTtl)
+                    .Select(m => m.ActorNr).ToList();
+                foreach (var actorNr in expired)
+                {
+                    room.RemoveMember(actorNr);
+                    if (room.CleanupCacheOnLeave)
+                        room.EventCache.RemoveAll(ce => ce.Sender == actorNr && !ce.Global);
+                    var leaveEvent = GpBinary.BuildEvent(EvCode.Leave, new Dictionary<byte, object?>
+                    {
+                        [Param.ActorNr]        = actorNr,
+                        [Param.ActorList]      = room.ActorNumbers,
+                        [Param.MasterClientId] = room.MasterClientActor,
+                        [Param.IsInactive]     = false,
+                    });
+                    BroadcastEvent(room, leaveEvent);
+                    Log($"[Server]   inactive actor {actorNr} in '{room.Name}' TTL-expired → removed");
+                }
+                if (room.PlayerCount == 0)
+                {
+                    _rooms.Remove(room.Name);
+                    Log($"[Server]   room '{room.Name}' empty → removed");
+                }
+            }
+        }
+
+        // Remove cached events matching a filter (used by RemoveFromRoomCache).
+        // Matches by event code, and if the filter is a hashtable, requires every
+        // filter key/value to be present in the cached event's data.
+        private static int RemoveMatchingCache(Room room, byte evCode, object? filter)
+        {
+            var filterDict = filter as Dictionary<object, object?>;
+            int before = room.EventCache.Count;
+            room.EventCache.RemoveAll(ce =>
+            {
+                if (ce.Code != evCode) return false;
+                if (filterDict == null || filterDict.Count == 0) return true;
+                if (ce.Data is not Dictionary<object, object?> cd) return false;
+                foreach (var kv in filterDict)
+                    if (!cd.TryGetValue(kv.Key, out var v) || !Equals(v, kv.Value)) return false;
+                return true;
+            });
+            return before - room.EventCache.Count;
         }
 
         private void HandleRaiseEvent(Peer peer, PhotonCommand cmd, PhotonMessage msg)
@@ -680,6 +866,26 @@ namespace PhotonServer
             byte evCode = msg.Parameters.TryGetValue(Param.Code, out var c) && c is byte b ? b : (byte)0;
             object? data = msg.Parameters.TryGetValue(Param.Data, out var d) ? d : null;
             byte group = msg.Parameters.TryGetValue(Param.ReceiverGroup, out var rg) && rg is byte g ? g : ReceiverGroup.Others;
+            byte cache = msg.Parameters.TryGetValue(Param.Cache, out var ca) && ca is byte cb ? cb : EventCaching.DoNotCache;
+
+            // Cache maintenance. Add-to-cache events are also broadcast live;
+            // remove-from-cache events only prune the buffer (no broadcast).
+            switch (cache)
+            {
+                case EventCaching.AddToRoomCache:
+                case EventCaching.AddToRoomCacheGlobal:
+                    room.EventCache.Add(new CachedEvent
+                    {
+                        Code = evCode, Data = data, Sender = peer.ActorNr,
+                        Global = cache == EventCaching.AddToRoomCacheGlobal,
+                    });
+                    LogV($"[{peer.EndPoint}]   cached ev={evCode} (cache now {room.EventCache.Count})");
+                    break;
+                case EventCaching.RemoveFromRoomCache:
+                    int removed = RemoveMatchingCache(room, evCode, data);
+                    LogV($"[{peer.EndPoint}]   removed {removed} cached ev={evCode}");
+                    return; // cache-only, do not broadcast
+            }
 
             var evParams = new Dictionary<byte, object?>
             {
@@ -692,7 +898,7 @@ namespace PhotonServer
             if (msg.Parameters.TryGetValue(Param.ActorList, out var tl) && tl is object?[] targets)
             {
                 foreach (var t in targets)
-                    if (t is int ta && room.Members.TryGetValue(ta, out var m))
+                    if (t is int ta && room.Members.TryGetValue(ta, out var m) && !m.IsInactive && m.Peer != null)
                         SendReliableMessage(m.Peer, 0, evBytes);
             }
             else
@@ -766,10 +972,16 @@ namespace PhotonServer
             {
                 foreach (var kv in props) room.Properties[kv.Key] = kv.Value;
                 // Well-known room property byte keys: 255=maxPlayers, 253=isOpen, 254=isVisible.
-                if (props.TryGetValue((byte)255, out var mp) && mp is byte mpb) room.MaxPlayers = mpb;
+                if (props.TryGetValue((byte)255, out var mp)) room.MaxPlayers = Convert.ToInt32(mp);
                 if (props.TryGetValue((byte)253, out var io) && io is bool iob) room.IsOpen = iob;
                 if (props.TryGetValue((byte)254, out var iv) && iv is bool ivb) room.IsVisible = ivb;
             }
+
+            // PlayerTtl (235) / EmptyRoomTtl (236) are top-level create params.
+            if (msg.Parameters.TryGetValue(Param.PlayerTtl, out var pt)) room.PlayerTtl = Convert.ToInt32(pt);
+            // Room flag bit 1 (0x02) = DeleteCacheOnLeave.
+            if (msg.Parameters.TryGetValue(Param.RoomFlags, out var rf))
+                room.CleanupCacheOnLeave = (Convert.ToInt32(rf) & 0x02) != 0;
         }
 
         private byte[] BuildGameListEvent()
@@ -830,32 +1042,81 @@ namespace PhotonServer
             return ms.ToArray();
         }
 
+        // Payloads larger than this are split into fragment commands (type 8).
+        private const int MaxUnfragmented = 1100;
+
         private void SendReliableMessage(Peer peer, byte channel, byte[] f3Payload)
         {
-            int seq = peer.NextOutSeq(channel);
+            if (f3Payload.Length <= MaxUnfragmented)
+            {
+                int seq = peer.NextOutSeq(channel);
+                RegisterAndSend(peer, channel, seq, BuildDataCommand(channel, seq, f3Payload));
+                return;
+            }
+
+            // Fragment: consecutive reliable sequence numbers, all sharing the
+            // first fragment's sequence as the start-sequence.
+            int count   = (f3Payload.Length + MaxUnfragmented - 1) / MaxUnfragmented;
+            int startSeq = 0;
+            for (int i = 0; i < count; i++)
+            {
+                int seq = peer.NextOutSeq(channel);
+                if (i == 0) startSeq = seq;
+                int offset = i * MaxUnfragmented;
+                int len = Math.Min(MaxUnfragmented, f3Payload.Length - offset);
+                var frag = BuildFragmentCommand(channel, seq, startSeq, count, i,
+                    f3Payload.Length, offset, f3Payload, offset, len);
+                RegisterAndSend(peer, channel, seq, frag);
+            }
+            LogV($"[{peer.EndPoint}] OUT fragmented {f3Payload.Length}b → {count} parts (startSeq={startSeq})");
+        }
+
+        private void RegisterAndSend(Peer peer, byte channel, int seq, byte[] cmdBytes)
+        {
+            long key = ((long)channel << 32) | (uint)seq;
+            peer.UnackedCommands[key] = new Peer.Unacked { CommandBytes = cmdBytes, LastSentMs = NowMs };
+            SendPacket(peer, new[] { cmdBytes });
+        }
+
+        private static byte[] BuildDataCommand(byte channel, int seq, byte[] payload)
+        {
             using var ms = new MemoryStream();
             ms.WriteByte((byte)CommandType.SendReliable);
             ms.WriteByte(channel);
             ms.WriteByte(0x01);                     // reliable
             ms.WriteByte(0x04);                     // reserved (observed value)
-            Wire.WriteI32(ms, 12 + f3Payload.Length);
+            Wire.WriteI32(ms, 12 + payload.Length);
             Wire.WriteI32(ms, seq);
-            ms.Write(f3Payload, 0, f3Payload.Length);
-            byte[] cmdBytes = ms.ToArray();
-
-            // Register for retransmission until ACKed.
-            long key = ((long)channel << 32) | (uint)seq;
-            peer.UnackedCommands[key] = new Peer.Unacked { CommandBytes = cmdBytes, LastSentMs = NowMs };
-
-            SendPacket(peer, new[] { cmdBytes });
+            ms.Write(payload, 0, payload.Length);
+            return ms.ToArray();
         }
 
-        // Send an event to every member of a room (optionally excluding one actor).
+        private static byte[] BuildFragmentCommand(byte channel, int seq, int startSeq, int count,
+            int fragNum, int totalLen, int fragOffset, byte[] src, int srcOffset, int srcLen)
+        {
+            using var ms = new MemoryStream();
+            ms.WriteByte((byte)CommandType.SendFragment);
+            ms.WriteByte(channel);
+            ms.WriteByte(0x01);                     // reliable
+            ms.WriteByte(0x04);                     // reserved
+            Wire.WriteI32(ms, 32 + srcLen);         // size = base(12) + frag header(20) + payload
+            Wire.WriteI32(ms, seq);
+            Wire.WriteI32(ms, startSeq);
+            Wire.WriteI32(ms, count);
+            Wire.WriteI32(ms, fragNum);
+            Wire.WriteI32(ms, totalLen);
+            Wire.WriteI32(ms, fragOffset);
+            ms.Write(src, srcOffset, srcLen);
+            return ms.ToArray();
+        }
+
+        // Send an event to every active member of a room (optionally excluding one
+        // actor). Inactive members have no live peer and are skipped.
         private void BroadcastEvent(Room room, byte[] eventPayload, int exceptActor = 0)
         {
             foreach (var m in room.Members.Values)
             {
-                if (m.ActorNr == exceptActor) continue;
+                if (m.ActorNr == exceptActor || m.IsInactive || m.Peer == null) continue;
                 SendReliableMessage(m.Peer, 0, eventPayload);
             }
         }

@@ -24,7 +24,16 @@ namespace PhotonServer
         Hashtable  = 0x68, // 'h'
         Dictionary = 0x44, // 'D'
         StringArray= 0x61, // 'a'
+        Custom     = 0x63, // 'c' — registered custom type (Vector3, Quaternion, …)
         IntArray   = 0x6E, // 'n' (unverified; kept for completeness)
+    }
+
+    // A registered custom type kept opaque: the server forwards/caches it without
+    // interpreting the payload (e.g. PUN Vector3=0x56, Quaternion=0x51).
+    public sealed class PhotonCustom
+    {
+        public byte   Code = 0;
+        public byte[] Data = Array.Empty<byte>();
     }
 
     // A parsed operation/event message.
@@ -153,6 +162,14 @@ namespace PhotonServer
                     var h = new Dictionary<object, object?>();
                     for (int i = 0; i < ln; i++) { var k = ReadValue(b, ref o); var v = ReadValue(b, ref o); if (k != null) h[k] = v; }
                     return h;
+                }
+                case GpType.Custom:
+                {
+                    byte code = b[o++];
+                    int ln = Wire.ReadU16(b, o); o += 2;
+                    var data = new byte[ln];
+                    Array.Copy(b, o, data, 0, ln); o += ln;
+                    return new PhotonCustom { Code = code, Data = data };
                 }
                 case GpType.Dictionary:
                 {
@@ -288,6 +305,12 @@ namespace PhotonServer
                     foreach (var item in arr) WriteValue(s, item);
                     break;
                 }
+                case PhotonCustom pc:
+                    s.WriteByte((byte)GpType.Custom);
+                    s.WriteByte(pc.Code);
+                    Wire.WriteU16(s, (ushort)pc.Data.Length);
+                    s.Write(pc.Data, 0, pc.Data.Length);
+                    break;
                 default:
                     throw new NotSupportedException($"Cannot serialize {v.GetType()}");
             }
@@ -320,6 +343,7 @@ namespace PhotonServer
                     foreach (var it in arr) parts.Add(Fmt(it));
                     return $"[{string.Join(", ", parts)}]";
                 }
+                case PhotonCustom pc: return $"custom(0x{pc.Code:X2})[{pc.Data.Length}]";
                 default: return v.ToString() ?? "?";
             }
         }

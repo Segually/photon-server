@@ -42,6 +42,14 @@ namespace PhotonServer
         public int    Size;
         public int    ReliableSeq;
         public int    UnreliableSeq;   // only for SendUnreliable
+
+        // Fragment fields (only for SendFragment, command type 8).
+        public int FragStartSeq;
+        public int FragCount;
+        public int FragNumber;
+        public int FragTotalLength;
+        public int FragOffset;
+
         public byte[] Payload = Array.Empty<byte>();
 
         public bool IsReliable => (Flags & 1) != 0;
@@ -107,6 +115,16 @@ namespace PhotonServer
                     if (o + 16 > len) break;
                     c.UnreliableSeq = ReadI32(b, o + 12);
                     payloadStart = o + 16;
+                }
+                else if (c.Type == CommandType.SendFragment)
+                {
+                    if (o + 32 > len) break;
+                    c.FragStartSeq    = ReadI32(b, o + 12);
+                    c.FragCount       = ReadI32(b, o + 16);
+                    c.FragNumber      = ReadI32(b, o + 20);
+                    c.FragTotalLength = ReadI32(b, o + 24);
+                    c.FragOffset      = ReadI32(b, o + 28);
+                    payloadStart = o + 32;
                 }
                 int end = o + c.Size;
                 if (c.Size < 12 || end > len) break;

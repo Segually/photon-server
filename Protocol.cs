@@ -63,4 +63,14 @@ namespace PhotonServer
         public const byte All    = 1; // everyone including sender
         public const byte Master = 2; // master client only
     }
+
+    // RaiseEvent caching options (param 247).
+    public static class EventCaching
+    {
+        public const byte DoNotCache             = 0;
+        public const byte AddToRoomCache         = 4;
+        public const byte AddToRoomCacheGlobal   = 5;
+        public const byte RemoveFromRoomCache    = 6;
+        public const byte RemoveFromRoomCacheForActorsLeft = 7;
+    }
 }

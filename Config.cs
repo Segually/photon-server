@@ -14,8 +14,10 @@ namespace PhotonServer
         /// clients configured with a custom master port.</summary>
         public int[] Ports { get; set; } = { 5055, 27000, 27001, 27002 };
 
-        /// <summary>Host advertised to clients for the create/join game-server
-        /// redirect. Use your public IP / DNS name for remote clients.</summary>
+        /// <summary>IP or hostname handed to clients for the create/join game-server
+        /// redirect (they reconnect here on the game-server port to enter a room).
+        /// Defaults to loopback for local testing — set this to your VPS's public
+        /// IP or DNS name when deploying so remote clients can reach it.</summary>
         public string PublicHost { get; set; } = "127.0.0.1";
 
         /// <summary>Hard cap on actors per room, applied to every room on top of

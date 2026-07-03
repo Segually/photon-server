@@ -146,7 +146,10 @@ namespace PhotonServer
         public void Run()
         {
             Log($"[Server] Photon UDP server listening on ports: {string.Join(", ", _ports)}");
-            Log($"[Server] game-server redirect address: {_publicAddress}");
+            Log($"[Server] game-server redirect address (config PublicHost): {_publicAddress}");
+            if (_config.PublicHost is "127.0.0.1" or "localhost" or "0.0.0.0")
+                Log("[Server] NOTE: PublicHost is loopback — set it to your public IP/DNS in " +
+                    "config.json so remote clients can reach the game server after redirect.");
             StartRetransmitThread();
 
             // One receive loop per bound socket; all funnel into the same handler

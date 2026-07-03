@@ -2,8 +2,10 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading;
 
 namespace PhotonServer
 {
@@ -11,6 +13,7 @@ namespace PhotonServer
     public sealed class Peer
     {
         public IPEndPoint EndPoint;
+        public UdpClient  Socket;      // socket this peer is connected on
         public ushort     PeerId;
         public int        Challenge;
 
@@ -28,6 +31,19 @@ namespace PhotonServer
         public bool Authenticated;
         public readonly DiffieHellman Dh = new();
 
+        // Master vs game-server role for this connection. A fresh connection is a
+        // "master" session; after a create/join redirect the client reconnects and
+        // authenticates with the issued token, which flips it into game mode.
+        public string? SessionToken;
+        public bool    GameMode;
+        public string? PendingRoom;
+        public bool    PendingCreate;
+
+        // Room membership.
+        public Room? Room;
+        public int   ActorNr;
+        public readonly Dictionary<object, object?> PlayerProperties = new();
+
         // Inbound reliable commands are delivered at-least-once (client retransmits
         // until ACKed). Track processed (channel, seq) so each is handled exactly once.
         private readonly HashSet<long> _processedReliable = new();
@@ -37,33 +53,89 @@ namespace PhotonServer
             return _processedReliable.Add(key); // false if already present
         }
 
-        public Peer(IPEndPoint ep, ushort id, int challenge)
+        // Outbound reliable commands awaiting ACK, keyed by (channel, seq).
+        public sealed class Unacked
         {
-            EndPoint = ep; PeerId = id; Challenge = challenge;
+            public byte[] CommandBytes = null!;
+            public long   LastSentMs;
+            public int    Retries;
+        }
+        public readonly Dictionary<long, Unacked> UnackedCommands = new();
+
+        public void OnAckReceived(byte channel, int seq)
+        {
+            long key = ((long)channel << 32) | (uint)seq;
+            UnackedCommands.Remove(key);
+        }
+
+        public Peer(IPEndPoint ep, UdpClient socket, ushort id, int challenge)
+        {
+            EndPoint = ep; Socket = socket; PeerId = id; Challenge = challenge;
         }
     }
 
     public sealed class PhotonServer
     {
-        private readonly int _port;
-        private readonly UdpClient _udp;
+        private readonly int[] _ports;
+        private readonly List<UdpClient> _sockets = new();
         private readonly Stopwatch _clock = Stopwatch.StartNew();
         private readonly Dictionary<IPEndPoint, Peer> _peers = new();
+        private readonly Dictionary<string, Room> _rooms = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, Session> _sessions = new(StringComparer.Ordinal);
+        private readonly object _sync = new();
         private ushort _nextPeerId = 0xC300;
+
+        // Address advertised to clients as the "game server" for create/join
+        // redirects. Same host as the master since we run combined on one port.
+        private readonly string _publicAddress;
+
+        // A session survives the master→game reconnect, carrying the pending room.
+        private sealed class Session
+        {
+            public string? PendingRoom;
+            public bool    PendingCreate;
+        }
+
+        // Retransmission tuning.
+        private const int RetransmitMs = 200;
+        private const int MaxRetries   = 12;
 
         // The server always sends packets with peer id 0x0000 in the header
         // (observed on the wire).
         private const ushort ServerHeaderPeerId = 0x0000;
 
-        public PhotonServer(int port)
+        public PhotonServer(int[] ports, string? publicHost = null)
         {
-            _port = port;
-            _udp = new UdpClient(new IPEndPoint(IPAddress.Any, port));
+            _ports = ports;
+            // The game-server port the client redirects to is fixed by the SDK's
+            // ServerPortOverrides (UDP GameServer = 27002), so advertise that.
+            int gamePort = ports.Contains(27002) ? 27002 : ports[0];
+            _publicAddress = $"{publicHost ?? "127.0.0.1"}:{gamePort}";
+            foreach (int p in ports)
+                _sockets.Add(new UdpClient(new IPEndPoint(IPAddress.Any, p)));
         }
 
         public void Run()
         {
-            Log($"[Server] Photon UDP server listening on 0.0.0.0:{_port}");
+            Log($"[Server] Photon UDP server listening on ports: {string.Join(", ", _ports)}");
+            Log($"[Server] game-server redirect address: {_publicAddress}");
+            StartRetransmitThread();
+
+            // One receive loop per bound socket; all funnel into the same handler
+            // under the global lock.
+            var threads = new List<Thread>();
+            foreach (var sock in _sockets)
+            {
+                var s = sock;
+                var t = new Thread(() => ReceiveLoop(s)) { IsBackground = true };
+                t.Start();
+                threads.Add(t);
+            }
+            foreach (var t in threads) t.Join();
+        }
+
+        private void ReceiveLoop(UdpClient sock)
+        {
             var remote = new IPEndPoint(IPAddress.Any, 0);
             while (true)
             {
@@ -71,28 +143,58 @@ namespace PhotonServer
                 IPEndPoint from;
                 try
                 {
-                    data = _udp.Receive(ref remote);
+                    data = sock.Receive(ref remote);
                     from = new IPEndPoint(remote.Address, remote.Port);
                 }
-                catch (SocketException e)
-                {
-                    Log($"[Server] recv error: {e.SocketErrorCode}");
-                    continue;
-                }
-                try { HandleDatagram(data, from); }
+                catch (SocketException) { continue; }
+                try { lock (_sync) HandleDatagram(data, from, sock); }
                 catch (Exception e) { Log($"[Server] handler error: {e}"); }
             }
         }
 
-        private uint Now => (uint)_clock.ElapsedMilliseconds;
+        private uint Now   => (uint)_clock.ElapsedMilliseconds;
+        private long NowMs => _clock.ElapsedMilliseconds;
+
+        // ── Outbound reliable retransmission ─────────────────────────────────
+        private void StartRetransmitThread()
+        {
+            var t = new Thread(() =>
+            {
+                while (true)
+                {
+                    Thread.Sleep(50);
+                    lock (_sync)
+                    {
+                        long now = NowMs;
+                        foreach (var peer in _peers.Values.ToList())
+                        {
+                            foreach (var kv in peer.UnackedCommands.ToList())
+                            {
+                                var u = kv.Value;
+                                if (now - u.LastSentMs < RetransmitMs) continue;
+                                if (u.Retries >= MaxRetries)
+                                {
+                                    peer.UnackedCommands.Remove(kv.Key);
+                                    continue;
+                                }
+                                u.Retries++;
+                                u.LastSentMs = now;
+                                SendPacket(peer, new[] { u.CommandBytes });
+                            }
+                        }
+                    }
+                }
+            }) { IsBackground = true, Name = "Retransmit" };
+            t.Start();
+        }
 
         // ── Datagram dispatch ────────────────────────────────────────────────
-        private void HandleDatagram(byte[] data, IPEndPoint from)
+        private void HandleDatagram(byte[] data, IPEndPoint from, UdpClient sock)
         {
             // 13-byte all-0x7D ping/echo → reflect verbatim (region latency probe).
             if (IsPingEcho(data))
             {
-                _udp.Send(data, data.Length, from);
+                sock.Send(data, data.Length, from);
                 return;
             }
 
@@ -111,13 +213,15 @@ namespace PhotonServer
                 switch (cmd.Type)
                 {
                     case CommandType.Connect:
-                        peer = HandleConnect(pkt, cmd, from);
+                        peer = HandleConnect(pkt, cmd, from, sock);
                         break;
                     case CommandType.Ack:
+                        if (peer != null && cmd.Payload.Length >= 4)
+                            peer.OnAckReceived(cmd.Channel, Wire.ReadI32(cmd.Payload, 0));
                         break;
                     case CommandType.Disconnect:
                         Log($"[{from}] DISCONNECT");
-                        if (peer != null) _peers.Remove(from);
+                        if (peer != null) { LeaveRoom(peer, becameInactive: false); _peers.Remove(from); }
                         break;
                     case CommandType.Ping:
                         break;
@@ -137,10 +241,10 @@ namespace PhotonServer
         }
 
         // ── Connection handshake ─────────────────────────────────────────────
-        private Peer HandleConnect(PhotonPacket pkt, PhotonCommand cmd, IPEndPoint from)
+        private Peer HandleConnect(PhotonPacket pkt, PhotonCommand cmd, IPEndPoint from, UdpClient sock)
         {
             ushort assignedId = _nextPeerId++;
-            var peer = new Peer(from, assignedId, pkt.Challenge);
+            var peer = new Peer(from, sock, assignedId, pkt.Challenge);
             _peers[from] = peer;
             Log($"[{from}] CONNECT → assigned peerId=0x{assignedId:X4} challenge=0x{pkt.Challenge:X8}");
 
@@ -249,35 +353,365 @@ namespace PhotonServer
         {
             switch (msg.Code)
             {
-                case 230: // Authenticate
+                case OpCode.Authenticate:
                 {
                     peer.Authenticated = true;
-                    // Success. [221]=secret token, [1]=assigned userId (GUID).
-                    var resp = GpBinary.BuildOpResponse(230, 0, null,
+
+                    // A token in [221] means the client is returning after a
+                    // create/join redirect — resume that session in game mode.
+                    string? inToken = msg.Parameters.TryGetValue(Param.Secret, out var sv) && sv is string ss ? ss : null;
+                    if (inToken != null && _sessions.TryGetValue(inToken, out var sess) && sess.PendingRoom != null)
+                    {
+                        peer.SessionToken  = inToken;
+                        peer.GameMode      = true;
+                        peer.PendingRoom   = sess.PendingRoom;
+                        peer.PendingCreate = sess.PendingCreate;
+                        Log($"[{peer.EndPoint}]   AUTH ok (GAME mode, pending room '{sess.PendingRoom}')");
+                    }
+                    else
+                    {
+                        peer.SessionToken = Guid.NewGuid().ToString("N");
+                        _sessions[peer.SessionToken] = new Session();
+                        Log($"[{peer.EndPoint}]   AUTH ok (MASTER mode)");
+                    }
+
+                    var resp = GpBinary.BuildOpResponse(OpCode.Authenticate, 0, null,
                         new Dictionary<byte, object?>
                         {
-                            [221] = Guid.NewGuid().ToString("N"),          // session secret
-                            [1]   = Guid.NewGuid().ToString(),             // userId
+                            [Param.Secret] = peer.SessionToken,
+                            [Param.UserId] = Guid.NewGuid().ToString(),
                         });
                     SendReliableMessage(peer, cmd.Channel, resp);
-                    Log($"[{peer.EndPoint}]   AUTHENTICATE ok");
                     break;
                 }
-                case 229: // JoinLobby
+                case OpCode.JoinLobby:
                 {
-                    var resp = GpBinary.BuildOpResponse(229, 0, null, null);
+                    var resp = GpBinary.BuildOpResponse(OpCode.JoinLobby, 0, null, null);
                     SendReliableMessage(peer, cmd.Channel, resp);
-                    // Event 230 = GameList (empty room list for now).
-                    var gameList = GpBinary.BuildEvent(230,
-                        new Dictionary<byte, object?> { [222] = new Dictionary<object, object?>() });
-                    SendReliableMessage(peer, cmd.Channel, gameList);
-                    Log($"[{peer.EndPoint}]   JOIN LOBBY ok (empty room list)");
+                    SendReliableMessage(peer, cmd.Channel, BuildGameListEvent());
+                    Log($"[{peer.EndPoint}]   JOIN LOBBY ok ({_rooms.Count} room(s) listed)");
                     break;
                 }
+                case OpCode.CreateGame:  HandleCreateGame(peer, cmd, msg); break;
+                case OpCode.JoinGame:    HandleJoinGame(peer, cmd, msg, createIfAbsent: false); break;
+                case OpCode.JoinRandomGame: HandleJoinRandom(peer, cmd, msg); break;
+                case OpCode.RaiseEvent:  HandleRaiseEvent(peer, cmd, msg); break;
+                case OpCode.SetProperties: HandleSetProperties(peer, cmd, msg); break;
+                case OpCode.Leave:       HandleLeaveOp(peer, cmd); break;
+                case OpCode.ChangeGroups:
+                    // Interest groups — accept silently.
+                    break;
                 default:
                     Log($"[{peer.EndPoint}]   op {msg.Code} — no handler yet");
                     break;
             }
+        }
+
+        // ── Room operations ──────────────────────────────────────────────────
+
+        // On the master, create/join don't enter a room — they hand the client a
+        // game-server address (ourselves) plus its session token, and the client
+        // reconnects there before actually entering.
+        private bool RedirectIfMaster(Peer peer, PhotonCommand cmd, byte opCode, string roomName, bool isCreate)
+        {
+            if (peer.GameMode) return false;
+            if (peer.SessionToken != null && _sessions.TryGetValue(peer.SessionToken, out var sess))
+            {
+                sess.PendingRoom   = roomName;
+                sess.PendingCreate = isCreate;
+            }
+            var resp = GpBinary.BuildOpResponse(opCode, 0, null, new Dictionary<byte, object?>
+            {
+                [Param.Address] = _publicAddress,
+                [Param.Secret]  = peer.SessionToken,
+                [Param.GameId]  = roomName,
+            });
+            SendReliableMessage(peer, cmd.Channel, resp);
+            Log($"[{peer.EndPoint}]   {(isCreate ? "CREATE" : "JOIN")} '{roomName}' → redirect to {_publicAddress}");
+            return true;
+        }
+
+        private void HandleCreateGame(Peer peer, PhotonCommand cmd, PhotonMessage msg)
+        {
+            string name = msg.Parameters.TryGetValue(Param.GameId, out var g) && g is string s && s.Length > 0
+                ? s : (peer.PendingRoom ?? Guid.NewGuid().ToString("N")[..8]);
+
+            if (RedirectIfMaster(peer, cmd, OpCode.CreateGame, name, isCreate: true)) return;
+
+            if (_rooms.ContainsKey(name))
+            {
+                // Room exists → error (game already exists = 32766).
+                SendReliableMessage(peer, cmd.Channel,
+                    GpBinary.BuildOpResponse(OpCode.CreateGame, 32766, "Game already exists", null));
+                Log($"[{peer.EndPoint}]   CREATE '{name}' FAILED (exists)");
+                return;
+            }
+
+            var room = new Room(name);
+            ApplyRoomOptions(room, msg);
+            _rooms[name] = room;
+            EnterRoom(peer, room, msg, OpCode.CreateGame);
+            Log($"[{peer.EndPoint}]   CREATE '{name}' ok (actor {peer.ActorNr}, master)");
+        }
+
+        private void HandleJoinGame(Peer peer, PhotonCommand cmd, PhotonMessage msg, bool createIfAbsent)
+        {
+            string name = msg.Parameters.TryGetValue(Param.GameId, out var g) && g is string s ? s : (peer.PendingRoom ?? "");
+
+            if (RedirectIfMaster(peer, cmd, OpCode.JoinGame, name, isCreate: false)) return;
+
+            // In game mode a create-turned-join (room already made by us) still enters.
+            if (peer.PendingCreate) createIfAbsent = true;
+
+            if (!_rooms.TryGetValue(name, out var room))
+            {
+                if (createIfAbsent)
+                {
+                    room = new Room(name);
+                    ApplyRoomOptions(room, msg);
+                    _rooms[name] = room;
+                }
+                else
+                {
+                    // Game does not exist = 32758.
+                    SendReliableMessage(peer, cmd.Channel,
+                        GpBinary.BuildOpResponse(OpCode.JoinGame, 32758, "Game does not exist", null));
+                    Log($"[{peer.EndPoint}]   JOIN '{name}' FAILED (missing)");
+                    return;
+                }
+            }
+            if (!room.IsOpen)
+            {
+                SendReliableMessage(peer, cmd.Channel,
+                    GpBinary.BuildOpResponse(OpCode.JoinGame, 32765, "Game closed", null));
+                return;
+            }
+            EnterRoom(peer, room, msg, OpCode.JoinGame);
+            Log($"[{peer.EndPoint}]   JOIN '{name}' ok (actor {peer.ActorNr})");
+        }
+
+        private void HandleJoinRandom(Peer peer, PhotonCommand cmd, PhotonMessage msg)
+        {
+            // Master picks a room and redirects; the client then joins it by name
+            // on the game server.
+            if (!peer.GameMode)
+            {
+                var pick = _rooms.Values.FirstOrDefault(r => r.IsOpen && r.IsVisible &&
+                    (r.MaxPlayers == 0 || r.PlayerCount < r.MaxPlayers));
+                if (pick == null)
+                {
+                    SendReliableMessage(peer, cmd.Channel,
+                        GpBinary.BuildOpResponse(OpCode.JoinRandomGame, 32760, "No match found", null));
+                    return;
+                }
+                RedirectIfMaster(peer, cmd, OpCode.JoinRandomGame, pick.Name, isCreate: false);
+                return;
+            }
+
+            if (peer.PendingRoom != null && _rooms.TryGetValue(peer.PendingRoom, out var room))
+            {
+                EnterRoom(peer, room, msg, OpCode.JoinRandomGame);
+                Log($"[{peer.EndPoint}]   JOIN RANDOM → '{room.Name}' (actor {peer.ActorNr})");
+            }
+        }
+
+        // Add the peer to a room and send the enter-room response + broadcast join.
+        private void EnterRoom(Peer peer, Room room, PhotonMessage msg, byte opCode)
+        {
+            // The joiner's own player properties come in param 249.
+            if (msg.Parameters.TryGetValue(Param.PlayerProperties, out var pp) &&
+                pp is Dictionary<object, object?> props)
+            {
+                peer.PlayerProperties.Clear();
+                foreach (var kv in props) peer.PlayerProperties[kv.Key] = kv.Value;
+            }
+
+            int actorNr = room.AddMember(peer);
+            peer.Room = room;
+            peer.ActorNr = actorNr;
+            room.Members[actorNr].Properties.Clear();
+            foreach (var kv in peer.PlayerProperties) room.Members[actorNr].Properties[kv.Key] = kv.Value;
+
+            // Build enter-room response: your actor number, all players' props, room props.
+            var allPlayers = new Dictionary<object, object?>();
+            foreach (var m in room.Members.Values)
+            {
+                var pd = new Dictionary<object, object?>();
+                foreach (var kv in m.Properties) pd[kv.Key] = kv.Value;
+                allPlayers[m.ActorNr] = pd;
+            }
+
+            // Room flag bits (param 191). Bit 2 is the "room entered" gate the
+            // client checks before firing OnJoinedRoom/OnCreatedRoom; echo the
+            // client's requested flags with that bit set.
+            byte flags = msg.Parameters.TryGetValue(Param.RoomFlags, out var fv)
+                ? Convert.ToByte(fv) : (byte)0;
+            flags |= 0x04;
+
+            var respParams = new Dictionary<byte, object?>
+            {
+                [Param.ActorNr]          = actorNr,
+                [Param.ActorList]        = room.ActorNumbers,
+                [Param.PlayerProperties] = allPlayers,
+                [Param.GameProperties]   = ToDict(room.Properties),
+                [Param.RoomFlags]        = (int)flags,
+            };
+            SendReliableMessage(peer, 0, GpBinary.BuildOpResponse(opCode, 0, null, respParams));
+
+            // Notify existing members that a new actor joined (Event 255).
+            var joinEvent = GpBinary.BuildEvent(EvCode.Join, new Dictionary<byte, object?>
+            {
+                [Param.ActorNr]          = actorNr,
+                [Param.ActorList]        = room.ActorNumbers,
+                [Param.PlayerProperties] = ToDict(peer.PlayerProperties),
+            });
+            BroadcastEvent(room, joinEvent, exceptActor: actorNr);
+        }
+
+        private void HandleLeaveOp(Peer peer, PhotonCommand cmd)
+        {
+            SendReliableMessage(peer, cmd.Channel, GpBinary.BuildOpResponse(OpCode.Leave, 0, null, null));
+            LeaveRoom(peer, becameInactive: false);
+        }
+
+        private void LeaveRoom(Peer peer, bool becameInactive)
+        {
+            var room = peer.Room;
+            if (room == null) return;
+            int actorNr = peer.ActorNr;
+            room.RemoveMember(actorNr);
+            peer.Room = null;
+            peer.ActorNr = 0;
+
+            var leaveEvent = GpBinary.BuildEvent(EvCode.Leave, new Dictionary<byte, object?>
+            {
+                [Param.ActorNr]        = actorNr,
+                [Param.ActorList]      = room.ActorNumbers,
+                [Param.MasterClientId] = room.MasterClientActor,
+                [Param.IsInactive]     = becameInactive,
+            });
+            BroadcastEvent(room, leaveEvent);
+            Log($"[{peer.EndPoint}]   LEFT room '{room.Name}' (actor {actorNr}); {room.PlayerCount} remain");
+
+            if (room.PlayerCount == 0)
+            {
+                _rooms.Remove(room.Name);
+                Log($"[Server]   room '{room.Name}' empty → removed");
+            }
+        }
+
+        private void HandleRaiseEvent(Peer peer, PhotonCommand cmd, PhotonMessage msg)
+        {
+            var room = peer.Room;
+            if (room == null) return;
+
+            byte evCode = msg.Parameters.TryGetValue(Param.Code, out var c) && c is byte b ? b : (byte)0;
+            object? data = msg.Parameters.TryGetValue(Param.Data, out var d) ? d : null;
+            byte group = msg.Parameters.TryGetValue(Param.ReceiverGroup, out var rg) && rg is byte g ? g : ReceiverGroup.Others;
+
+            var evParams = new Dictionary<byte, object?>
+            {
+                [Param.Data]    = data,
+                [Param.ActorNr] = peer.ActorNr,
+            };
+            byte[] evBytes = GpBinary.BuildEvent(evCode, evParams);
+
+            // Explicit target actor list overrides the receiver group.
+            if (msg.Parameters.TryGetValue(Param.ActorList, out var tl) && tl is object?[] targets)
+            {
+                foreach (var t in targets)
+                    if (t is int ta && room.Members.TryGetValue(ta, out var m))
+                        SendReliableMessage(m.Peer, 0, evBytes);
+            }
+            else
+            {
+                switch (group)
+                {
+                    case ReceiverGroup.All:
+                        BroadcastEvent(room, evBytes);
+                        break;
+                    case ReceiverGroup.Master:
+                        if (room.Members.TryGetValue(room.MasterClientActor, out var mc))
+                            SendReliableMessage(mc.Peer, 0, evBytes);
+                        break;
+                    default: // Others
+                        BroadcastEvent(room, evBytes, exceptActor: peer.ActorNr);
+                        break;
+                }
+            }
+            Log($"[{peer.EndPoint}]   RAISE ev={evCode} group={group} → routed");
+        }
+
+        private void HandleSetProperties(Peer peer, PhotonCommand cmd, PhotonMessage msg)
+        {
+            var room = peer.Room;
+            if (room == null) return;
+
+            var changed = msg.Parameters.TryGetValue(Param.Properties, out var p) && p is Dictionary<object, object?> pd
+                ? pd : new Dictionary<object, object?>();
+            int target = msg.Parameters.TryGetValue(Param.TargetActorNr, out var t) && t is int ti ? ti : 0;
+
+            if (target == 0) // room properties
+            {
+                foreach (var kv in changed) room.Properties[kv.Key] = kv.Value;
+            }
+            else if (room.Members.TryGetValue(target, out var m)) // actor properties
+            {
+                foreach (var kv in changed) m.Properties[kv.Key] = kv.Value;
+            }
+
+            SendReliableMessage(peer, cmd.Channel, GpBinary.BuildOpResponse(OpCode.SetProperties, 0, null, null));
+
+            // Broadcast the change to everyone (Event 253).
+            var evt = GpBinary.BuildEvent(EvCode.PropertiesChanged, new Dictionary<byte, object?>
+            {
+                [Param.Properties]    = changed,
+                [Param.TargetActorNr] = target,
+                [Param.ActorNr]       = peer.ActorNr,
+            });
+            BroadcastEvent(room, evt, exceptActor: peer.ActorNr);
+            Log($"[{peer.EndPoint}]   SETPROPS target={(target == 0 ? "room" : target.ToString())} → broadcast");
+        }
+
+        // ── Room helpers ─────────────────────────────────────────────────────
+
+        private void ApplyRoomOptions(Room room, PhotonMessage msg)
+        {
+            // Room creation options are nested; MaxPlayers/flags arrive via game
+            // properties (248) or dedicated params depending on client version.
+            if (msg.Parameters.TryGetValue(Param.GameProperties, out var gp) &&
+                gp is Dictionary<object, object?> props)
+            {
+                foreach (var kv in props) room.Properties[kv.Key] = kv.Value;
+                // Well-known room property byte keys: 255=maxPlayers, 253=isOpen, 254=isVisible.
+                if (props.TryGetValue((byte)255, out var mp) && mp is byte mpb) room.MaxPlayers = mpb;
+                if (props.TryGetValue((byte)253, out var io) && io is bool iob) room.IsOpen = iob;
+                if (props.TryGetValue((byte)254, out var iv) && iv is bool ivb) room.IsVisible = ivb;
+            }
+        }
+
+        private byte[] BuildGameListEvent()
+        {
+            var list = new Dictionary<object, object?>();
+            foreach (var room in _rooms.Values)
+            {
+                if (!room.IsVisible) continue;
+                list[room.Name] = new Dictionary<object, object?>
+                {
+                    [(byte)243] = room.PlayerCount,             // player count
+                    [(byte)255] = room.MaxPlayers,             // max players
+                    [(byte)253] = room.IsOpen,                 // is open
+                    [(byte)252] = room.IsVisible,              // is visible
+                };
+            }
+            return GpBinary.BuildEvent(EvCode.GameList, new Dictionary<byte, object?> { [222] = list });
+        }
+
+        private static Dictionary<object, object?> ToDict(Dictionary<object, object?> src)
+        {
+            var d = new Dictionary<object, object?>();
+            foreach (var kv in src) d[kv.Key] = kv.Value;
+            return d;
         }
 
         // ── Command builders ─────────────────────────────────────────────────
@@ -325,8 +759,23 @@ namespace PhotonServer
             Wire.WriteI32(ms, 12 + f3Payload.Length);
             Wire.WriteI32(ms, seq);
             ms.Write(f3Payload, 0, f3Payload.Length);
-            SendPacket(peer, new[] { ms.ToArray() });
-            Log($"[{peer.EndPoint}] OUT ch{channel} seq={seq} ({f3Payload.Length}b) {Hex(f3Payload, Math.Min(f3Payload.Length, 32))}");
+            byte[] cmdBytes = ms.ToArray();
+
+            // Register for retransmission until ACKed.
+            long key = ((long)channel << 32) | (uint)seq;
+            peer.UnackedCommands[key] = new Peer.Unacked { CommandBytes = cmdBytes, LastSentMs = NowMs };
+
+            SendPacket(peer, new[] { cmdBytes });
+        }
+
+        // Send an event to every member of a room (optionally excluding one actor).
+        private void BroadcastEvent(Room room, byte[] eventPayload, int exceptActor = 0)
+        {
+            foreach (var m in room.Members.Values)
+            {
+                if (m.ActorNr == exceptActor) continue;
+                SendReliableMessage(m.Peer, 0, eventPayload);
+            }
         }
 
         private void AckIfReliable(Peer peer, PhotonPacket pkt, PhotonCommand cmd)
@@ -347,7 +796,7 @@ namespace PhotonServer
             Wire.WriteI32(ms, peer.Challenge);      // echo challenge
             foreach (var c in commands) ms.Write(c, 0, c.Length);
             byte[] datagram = ms.ToArray();
-            _udp.Send(datagram, datagram.Length, peer.EndPoint);
+            peer.Socket.Send(datagram, datagram.Length, peer.EndPoint);
         }
 
         // ── Helpers ──────────────────────────────────────────────────────────

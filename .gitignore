@@ -483,3 +483,6 @@ $RECYCLE.BIN/
 
 # Claude Code
 .claude/
+
+# Probe RPC logs (created when running the test client from here)
+rpc_log_*.txt

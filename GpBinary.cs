@@ -246,6 +246,34 @@ namespace PhotonServer
                     Wire.WriteI32(s, ba.Length);
                     s.Write(ba, 0, ba.Length);
                     break;
+                case int[] ia:
+                    s.WriteByte((byte)GpType.Array);
+                    Wire.WriteU16(s, (ushort)ia.Length);
+                    s.WriteByte((byte)GpType.Int);
+                    foreach (var i in ia) Wire.WriteI32(s, i);
+                    break;
+                case float[] fa:
+                    s.WriteByte((byte)GpType.Array);
+                    Wire.WriteU16(s, (ushort)fa.Length);
+                    s.WriteByte((byte)GpType.Float);
+                    foreach (var f in fa) Wire.WriteI32(s, BitConverter.SingleToInt32Bits(f));
+                    break;
+                case bool[] boa:
+                    s.WriteByte((byte)GpType.Array);
+                    Wire.WriteU16(s, (ushort)boa.Length);
+                    s.WriteByte((byte)GpType.Bool);
+                    foreach (var b2 in boa) s.WriteByte((byte)(b2 ? 1 : 0));
+                    break;
+                case string[] sa:
+                    s.WriteByte((byte)GpType.StringArray);
+                    Wire.WriteU16(s, (ushort)sa.Length);
+                    foreach (var str2 in sa)
+                    {
+                        var sb = Encoding.UTF8.GetBytes(str2 ?? "");
+                        Wire.WriteU16(s, (ushort)sb.Length);
+                        s.Write(sb, 0, sb.Length);
+                    }
+                    break;
                 case Dictionary<object, object?> ht:
                 {
                     s.WriteByte((byte)GpType.Hashtable);

@@ -38,6 +38,7 @@ namespace PhotonServer
         public bool    GameMode;
         public string? PendingRoom;
         public bool    PendingCreate;
+        public long    LastRecvMs;   // for idle-timeout sweeps
 
         // Room membership.
         public Room? Room;
@@ -76,6 +77,7 @@ namespace PhotonServer
 
     public sealed class PhotonServer
     {
+        private readonly ServerConfig _config;
         private readonly int[] _ports;
         private readonly List<UdpClient> _sockets = new();
         private readonly Stopwatch _clock = Stopwatch.StartNew();
@@ -94,6 +96,18 @@ namespace PhotonServer
         {
             public string? PendingRoom;
             public bool    PendingCreate;
+            public long    CreatedMs;
+        }
+
+        // Remove a peer's session unless a redirect is still pending on the master
+        // connection (the client is about to reconnect with this token).
+        private void CleanupSession(Peer peer)
+        {
+            if (peer.SessionToken == null) return;
+            if (!peer.GameMode &&
+                _sessions.TryGetValue(peer.SessionToken, out var s) && s.PendingRoom != null)
+                return; // keep alive for the imminent game-server reconnect
+            _sessions.Remove(peer.SessionToken);
         }
 
         // Retransmission tuning.
@@ -104,14 +118,15 @@ namespace PhotonServer
         // (observed on the wire).
         private const ushort ServerHeaderPeerId = 0x0000;
 
-        public PhotonServer(int[] ports, string? publicHost = null)
+        public PhotonServer(ServerConfig config)
         {
-            _ports = ports;
+            _config = config;
+            _ports = config.Ports;
             // The game-server port the client redirects to is fixed by the SDK's
             // ServerPortOverrides (UDP GameServer = 27002), so advertise that.
-            int gamePort = ports.Contains(27002) ? 27002 : ports[0];
-            _publicAddress = $"{publicHost ?? "127.0.0.1"}:{gamePort}";
-            foreach (int p in ports)
+            int gamePort = _ports.Contains(27002) ? 27002 : _ports[0];
+            _publicAddress = $"{config.PublicHost}:{gamePort}";
+            foreach (int p in _ports)
                 _sockets.Add(new UdpClient(new IPEndPoint(IPAddress.Any, p)));
         }
 
@@ -166,8 +181,25 @@ namespace PhotonServer
                     lock (_sync)
                     {
                         long now = NowMs;
+
+                        // Expire redirect sessions the client never came back for.
+                        foreach (var kv in _sessions.Where(s => s.Value.PendingRoom != null &&
+                                     now - s.Value.CreatedMs > 30000).ToList())
+                            _sessions.Remove(kv.Key);
+
                         foreach (var peer in _peers.Values.ToList())
                         {
+                            // Idle-timeout sweep: drop peers that have gone silent
+                            // (crashed clients that never sent a Disconnect).
+                            if (_config.PeerTimeoutMs > 0 && now - peer.LastRecvMs > _config.PeerTimeoutMs)
+                            {
+                                Log($"[{peer.EndPoint}] idle timeout ({now - peer.LastRecvMs}ms) — dropping");
+                                LeaveRoom(peer, becameInactive: false);
+                                _peers.Remove(peer.EndPoint);
+                                CleanupSession(peer);
+                                continue;
+                            }
+
                             foreach (var kv in peer.UnackedCommands.ToList())
                             {
                                 var u = kv.Value;
@@ -202,6 +234,7 @@ namespace PhotonServer
             if (pkt == null) { Log($"[{from}] unparseable ({data.Length}b): {Hex(data, data.Length)}"); return; }
 
             _peers.TryGetValue(from, out Peer? peer);
+            if (peer != null) peer.LastRecvMs = NowMs;
 
             foreach (var cmd in pkt.Commands)
             {
@@ -221,7 +254,12 @@ namespace PhotonServer
                         break;
                     case CommandType.Disconnect:
                         Log($"[{from}] DISCONNECT");
-                        if (peer != null) { LeaveRoom(peer, becameInactive: false); _peers.Remove(from); }
+                        if (peer != null)
+                        {
+                            LeaveRoom(peer, becameInactive: false);
+                            _peers.Remove(from);
+                            CleanupSession(peer);
+                        }
                         break;
                     case CommandType.Ping:
                         break;
@@ -234,7 +272,7 @@ namespace PhotonServer
                         HandleMessage(peer, cmd);
                         break;
                     default:
-                        Log($"[{from}] control command {(byte)cmd.Type} ch{cmd.Channel} seq{cmd.ReliableSeq} (acked)");
+                        LogV($"[{from}] control command {(byte)cmd.Type} ch{cmd.Channel} seq{cmd.ReliableSeq} (acked)");
                         break;
                 }
             }
@@ -244,7 +282,7 @@ namespace PhotonServer
         private Peer HandleConnect(PhotonPacket pkt, PhotonCommand cmd, IPEndPoint from, UdpClient sock)
         {
             ushort assignedId = _nextPeerId++;
-            var peer = new Peer(from, sock, assignedId, pkt.Challenge);
+            var peer = new Peer(from, sock, assignedId, pkt.Challenge) { LastRecvMs = NowMs };
             _peers[from] = peer;
             Log($"[{from}] CONNECT → assigned peerId=0x{assignedId:X4} challenge=0x{pkt.Challenge:X8}");
 
@@ -293,7 +331,7 @@ namespace PhotonServer
                 full[1] = (byte)(rawType & 0x7F);
                 Array.Copy(plain, 0, full, 2, plain.Length);
                 var dmsg = GpBinary.ParseMessage(full);
-                Log($"[{peer.EndPoint}] IN* {dmsg}   (decrypted {plain.Length}b)");
+                LogV($"[{peer.EndPoint}] IN* {dmsg}   (decrypted {plain.Length}b)");
                 if (dmsg != null) DispatchMessage(peer, cmd, dmsg);
                 return;
             }
@@ -301,7 +339,7 @@ namespace PhotonServer
             var msg = GpBinary.ParseMessage(payload);
             if (msg == null) { Log($"[{peer.EndPoint}] unparsed msg: {Hex(payload, payload.Length)}"); return; }
 
-            Log($"[{peer.EndPoint}] IN  {msg}");
+            LogV($"[{peer.EndPoint}] IN  {msg}");
             DispatchMessage(peer, cmd, msg);
         }
 
@@ -355,6 +393,27 @@ namespace PhotonServer
             {
                 case OpCode.Authenticate:
                 {
+                    // Optional AppId / AppVersion gating (only present on the first,
+                    // master-side auth; the game-server re-auth carries only a token).
+                    if (_config.RequireAppId != null &&
+                        msg.Parameters.TryGetValue(Param.AppId, out var aid) && aid is string aids &&
+                        aids != _config.RequireAppId)
+                    {
+                        SendReliableMessage(peer, cmd.Channel,
+                            GpBinary.BuildOpResponse(OpCode.Authenticate, 32755, "Invalid AppId", null));
+                        Log($"[{peer.EndPoint}]   AUTH rejected (AppId '{aids}')");
+                        break;
+                    }
+                    if (_config.RequireAppVersion != null &&
+                        msg.Parameters.TryGetValue(Param.AppVersion, out var av) && av is string avs &&
+                        avs != _config.RequireAppVersion)
+                    {
+                        SendReliableMessage(peer, cmd.Channel,
+                            GpBinary.BuildOpResponse(OpCode.Authenticate, 32755, "Invalid AppVersion", null));
+                        Log($"[{peer.EndPoint}]   AUTH rejected (AppVersion '{avs}')");
+                        break;
+                    }
+
                     peer.Authenticated = true;
 
                     // A token in [221] means the client is returning after a
@@ -371,7 +430,7 @@ namespace PhotonServer
                     else
                     {
                         peer.SessionToken = Guid.NewGuid().ToString("N");
-                        _sessions[peer.SessionToken] = new Session();
+                        _sessions[peer.SessionToken] = new Session { CreatedMs = NowMs };
                         Log($"[{peer.EndPoint}]   AUTH ok (MASTER mode)");
                     }
 
@@ -446,6 +505,13 @@ namespace PhotonServer
                 Log($"[{peer.EndPoint}]   CREATE '{name}' FAILED (exists)");
                 return;
             }
+            if (_config.MaxRooms > 0 && _rooms.Count >= _config.MaxRooms)
+            {
+                SendReliableMessage(peer, cmd.Channel,
+                    GpBinary.BuildOpResponse(OpCode.CreateGame, 32760, "Server room limit reached", null));
+                Log($"[{peer.EndPoint}]   CREATE '{name}' FAILED (server at {_config.MaxRooms} rooms)");
+                return;
+            }
 
             var room = new Room(name);
             ApplyRoomOptions(room, msg);
@@ -483,7 +549,14 @@ namespace PhotonServer
             if (!room.IsOpen)
             {
                 SendReliableMessage(peer, cmd.Channel,
-                    GpBinary.BuildOpResponse(OpCode.JoinGame, 32765, "Game closed", null));
+                    GpBinary.BuildOpResponse(OpCode.JoinGame, 32764, "Game closed", null));
+                return;
+            }
+            if (RoomIsFull(room))
+            {
+                SendReliableMessage(peer, cmd.Channel,
+                    GpBinary.BuildOpResponse(OpCode.JoinGame, 32765, "Game full", null));
+                Log($"[{peer.EndPoint}]   JOIN '{name}' FAILED (full)");
                 return;
             }
             EnterRoom(peer, room, msg, OpCode.JoinGame);
@@ -496,8 +569,7 @@ namespace PhotonServer
             // on the game server.
             if (!peer.GameMode)
             {
-                var pick = _rooms.Values.FirstOrDefault(r => r.IsOpen && r.IsVisible &&
-                    (r.MaxPlayers == 0 || r.PlayerCount < r.MaxPlayers));
+                var pick = _rooms.Values.FirstOrDefault(r => r.IsOpen && r.IsVisible && !RoomIsFull(r));
                 if (pick == null)
                 {
                     SendReliableMessage(peer, cmd.Channel,
@@ -639,7 +711,7 @@ namespace PhotonServer
                         break;
                 }
             }
-            Log($"[{peer.EndPoint}]   RAISE ev={evCode} group={group} → routed");
+            LogV($"[{peer.EndPoint}]   RAISE ev={evCode} group={group} → routed");
         }
 
         private void HandleSetProperties(Peer peer, PhotonCommand cmd, PhotonMessage msg)
@@ -674,6 +746,16 @@ namespace PhotonServer
         }
 
         // ── Room helpers ─────────────────────────────────────────────────────
+
+        // A room is full when it has reached its own MaxPlayers or the server-wide
+        // MaxPeersPerRoom cap, whichever is lower. 0/-1 mean "no limit" for each.
+        private bool RoomIsFull(Room room)
+        {
+            int effMax = room.MaxPlayers; // 0 = unlimited (Photon convention)
+            int cap = _config.MaxPeersPerRoom;
+            if (cap > 0) effMax = effMax == 0 ? cap : Math.Min(effMax, cap);
+            return effMax > 0 && room.PlayerCount >= effMax;
+        }
 
         private void ApplyRoomOptions(Room room, PhotonMessage msg)
         {
@@ -812,5 +894,11 @@ namespace PhotonServer
 
         private static void Log(string msg) =>
             Console.WriteLine($"{DateTime.Now:HH:mm:ss.fff} {msg}");
+
+        // Verbose per-packet/per-op logging, gated by config.
+        private void LogV(string msg)
+        {
+            if (_config.VerboseLogging) Log(msg);
+        }
     }
 }

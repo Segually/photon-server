@@ -1,11 +1,15 @@
+using System;
+using System.IO;
 using PhotonServer;
 
-// Bind the standard Photon UDP ports (name server / master / game = 27000/27001/27002)
-// plus 5055 for clients configured with a custom master port. Extra ports may be
-// passed as CLI args.
-int[] ports = args.Length > 0
-    ? Array.ConvertAll(args, a => int.Parse(a))
-    : new[] { 5055, 27000, 27001, 27002 };
+// Config lives next to the executable's working directory. A default config.json
+// is written on first run.
+string configPath = Path.Combine(Directory.GetCurrentDirectory(), "config.json");
+var config = ServerConfig.Load(configPath);
 
-Console.WriteLine("photon-server (protocol probe build)");
-new PhotonServer.PhotonServer(ports).Run();
+// A single port list may also be passed on the command line to override config.
+if (args.Length > 0)
+    config.Ports = Array.ConvertAll(args, a => int.Parse(a));
+
+Console.WriteLine("photon-server");
+new PhotonServer.PhotonServer(config).Run();

@@ -486,3 +486,6 @@ $RECYCLE.BIN/
 
 # Probe RPC logs (created when running the test client from here)
 rpc_log_*.txt
+
+# Runtime host config (generated on first run)
+config.json

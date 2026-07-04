@@ -315,7 +315,7 @@ namespace PhotonServer
             Log($"[{from}] CONNECT → assigned peerId=0x{assignedId:X4} challenge=0x{pkt.Challenge:X8}");
 
             // Reply: ACK(the connect) + VERIFY_CONNECT(with assigned peer id).
-            var ack    = BuildAck(cmd.ReliableSeq, pkt.Timestamp);
+            var ack    = BuildAck(cmd.Channel, cmd.ReliableSeq, pkt.Timestamp);
             var verify = BuildVerifyConnect(peer, cmd);
             SendPacket(peer, new[] { ack, verify });
             return peer;
@@ -1067,11 +1067,16 @@ namespace PhotonServer
         }
 
         // ── Command builders ─────────────────────────────────────────────────
-        private static byte[] BuildAck(int ackedSeq, uint sentTime)
+        // An ACK must carry the SAME channel as the command it acknowledges: the
+        // client matches an incoming ACK to an outstanding reliable command by
+        // (channel, reliableSeq) — see NCommand.CreateAck / RemoveSentReliableCommand
+        // in the client. Acking on the wrong channel leaves the command unacked, so
+        // the client retransmits it ~7× and then self-disconnects (~2s).
+        private static byte[] BuildAck(byte channel, int ackedSeq, uint sentTime)
         {
             using var ms = new MemoryStream();
             ms.WriteByte((byte)CommandType.Ack);
-            ms.WriteByte(0xFF);      // channel
+            ms.WriteByte(channel);   // channel of the acked command
             ms.WriteByte(0x00);      // flags (unreliable)
             ms.WriteByte(0x00);      // reserved
             Wire.WriteI32(ms, 20);   // size (12 header + 8 payload)
@@ -1183,7 +1188,7 @@ namespace PhotonServer
         private void AckIfReliable(Peer peer, PhotonPacket pkt, PhotonCommand cmd)
         {
             if (!cmd.IsReliable) return;
-            var ack = BuildAck(cmd.ReliableSeq, pkt.Timestamp);
+            var ack = BuildAck(cmd.Channel, cmd.ReliableSeq, pkt.Timestamp);
             SendPacket(peer, new[] { ack });
         }
 

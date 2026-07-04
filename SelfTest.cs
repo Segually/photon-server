@@ -74,6 +74,54 @@ namespace PhotonServer
             Check("DH key length", ((byte[])dhMsg.Parameters[1]!).Length == 96);
             Check("DH key content", ((byte[])dhMsg.Parameters[1]!)[95] == 95);
 
+            // 4) Event-relay shape: reproduce what HandleRaiseEvent pushes back
+            //    out — the event data at param 245, sender actor at 254 — using the
+            //    exact PUN Instantiate (ev 202) and RPC (ev 200) hashtables observed
+            //    on the wire, including nested custom types and a mixed object[].
+            //    This is the V18 path a second player receives on relay/cache-replay.
+            var instantiateData = new Dictionary<object, object?>
+            {
+                [(byte)0] = "NetworkPlayer",
+                [(byte)1] = new PhotonCustom { Code = 0x56, Data = new byte[12] }, // Vector3
+                [(byte)2] = new PhotonCustom { Code = 0x51, Data = new byte[16] }, // Quaternion
+                [(byte)6] = 92006,
+                [(byte)7] = 10002,
+            };
+            var evInst = GpBinaryV18.BuildEvent(202, new Dictionary<byte, object?>
+            {
+                [245] = instantiateData,
+                [254] = 1,
+            });
+            var ri = GpBinaryV18.ParseMessage(evInst, out int c4);
+            Check("relay(202) consumed", c4 == evInst.Length);
+            Check("relay(202) sender", (int)ri!.Parameters[254]! == 1);
+            var idata = (Dictionary<object, object?>)ri.Parameters[245]!;
+            Check("relay(202) prefab", (string)idata[(byte)0]! == "NetworkPlayer");
+            Check("relay(202) pos custom", ((PhotonCustom)idata[(byte)1]!).Code == 0x56 && ((PhotonCustom)idata[(byte)1]!).Data.Length == 12);
+            Check("relay(202) rot custom", ((PhotonCustom)idata[(byte)2]!).Code == 0x51 && ((PhotonCustom)idata[(byte)2]!).Data.Length == 16);
+            Check("relay(202) viewId", (int)idata[(byte)7]! == 10002);
+
+            var rpcData = new Dictionary<object, object?>
+            {
+                [(byte)0] = 10002,                                                   // viewID
+                [(byte)2] = 92008,                                                   // timestamp
+                [(byte)5] = (byte)56,                                                // rpc shortcut (byte!)
+                [(byte)4] = new object?[] { new PhotonCustom { Code = 0x56, Data = new byte[12] }, 191 },
+            };
+            var evRpc = GpBinaryV18.BuildEvent(200, new Dictionary<byte, object?>
+            {
+                [245] = rpcData,
+                [254] = 1,
+            });
+            var rr = GpBinaryV18.ParseMessage(evRpc, out int c5);
+            Check("relay(200) consumed", c5 == evRpc.Length);
+            var rdata = (Dictionary<object, object?>)rr!.Parameters[245]!;
+            Check("relay(200) viewId", (int)rdata[(byte)0]! == 10002);
+            Check("relay(200) rpc shortcut stays byte", rdata[(byte)5] is byte s && s == 56);
+            var rargs = (object?[])rdata[(byte)4]!;
+            Check("relay(200) arg0 custom", ((PhotonCustom)rargs[0]!).Code == 0x56);
+            Check("relay(200) arg1 int", (int)rargs[1]! == 191);
+
             Console.WriteLine(_fail == 0 ? "ALL PASS" : $"{_fail} FAILED");
             Environment.Exit(_fail == 0 ? 0 : 1);
         }

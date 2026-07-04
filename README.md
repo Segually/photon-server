@@ -1,6 +1,12 @@
+<div align="center">
+  <img src="assets/banner.png" alt="photon-server" width="720">
+</div>
+
 # photon-server
 
 A self-hosted server alternative to Photon Cloud, designed for private servers compatible with PUN2 (UDP) clients.
+
+> **Why is the logo a robot bear?** In the interest of transparency: this project was originally built to host private servers for the game *Super Bear Adventure*, which is where the robot-bear logo comes from. The server itself is game-agnostic — see [Scope & Current Goals](#scope--current-goals).
 
 ## Overview
 

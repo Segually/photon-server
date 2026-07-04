@@ -48,7 +48,12 @@ namespace PhotonServer
         public const byte AppId            = 224;
         public const byte UserId           = 225;
         public const byte RoomOptionCleanup= 241;
-        public const byte MasterClientId   = 203;
+        public const byte MasterClientId   = 203; // leave-event param: new master actor
+        // Well-known GAME-PROPERTY key (inside the room-properties hashtable) that
+        // carries the master client's actor number. The client caches it into
+        // Room.MasterClientId, which drives IsMasterClient. Numerically equals the
+        // GameProperties container code but lives in a different scope.
+        public const byte MasterClientKey  = 248; // GamePropertyKey.MasterClientId
         public const byte RoomFlags        = 191; // room option bit flags
         public const byte IsInactive       = 233;
         public const byte EmptyRoomTtl     = 236;

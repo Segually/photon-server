@@ -781,12 +781,22 @@ namespace PhotonServer
                 ? Convert.ToByte(fv) : (byte)0;
             flags |= 0x04;
 
+            // Game (room) properties, plus the well-known MasterClientId key (248):
+            // the client reads room-property 248 into Room.MasterClientId
+            // (RoomInfo.InternalCacheProperties) and IsMasterClient is
+            // MasterClientId == LocalActorNr. Without it the first host has
+            // MasterClientId=0, is NOT recognised as master, and the game's
+            // master-only lobby setup never runs (character never spawns) until a
+            // later handoff sets it via the Leave event's param 203.
+            var gameProps = ToDict(room.Properties);
+            gameProps[(byte)Param.MasterClientKey] = room.MasterClientActor;
+
             var respParams = new Dictionary<byte, object?>
             {
                 [Param.ActorNr]          = actorNr,
                 [Param.ActorList]        = room.ActorNumbers,
                 [Param.PlayerProperties] = allPlayers,
-                [Param.GameProperties]   = ToDict(room.Properties),
+                [Param.GameProperties]   = gameProps,
                 [Param.RoomFlags]        = (int)flags,
             };
             SendReliableMessage(peer, 0, BuildOpResp(peer, opCode, 0, null, respParams));

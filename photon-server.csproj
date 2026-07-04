@@ -8,4 +8,17 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
+  <!-- The API assembly and the plugin/mod sources live in sibling folders and
+       must not be swept into the server's own compile by the SDK glob. -->
+  <ItemGroup>
+    <Compile Remove="api/**/*.cs" />
+    <Compile Remove="mods/**/*.cs" />
+    <Compile Remove="plugins/**/*.cs" />
+    <Compile Remove="publish/**/*.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="api/PhotonServer.Api.csproj" />
+  </ItemGroup>
+
 </Project>

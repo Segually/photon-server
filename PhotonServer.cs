@@ -9,8 +9,10 @@ using System.Threading;
 
 namespace PhotonServer
 {
-    // Per-connected-peer reliability + identity state.
-    public sealed class Peer
+    // Per-connected-peer reliability + identity state. Implements IPlayer so a
+    // peer that has not yet entered a room (e.g. during the RoomCreating hook)
+    // can still be surfaced to plugins as the acting player.
+    public sealed class Peer : Api.IPlayer
     {
         public IPEndPoint EndPoint;
         public UdpClient  Socket;      // socket this peer is connected on
@@ -88,9 +90,18 @@ namespace PhotonServer
         {
             EndPoint = ep; Socket = socket; PeerId = id; Challenge = challenge;
         }
+
+        // ── IPlayer (plugin-facing read-only view of the acting connection) ──
+        int     Api.IPlayer.ActorNr    => ActorNr;
+        string? Api.IPlayer.UserId     => UserId;
+        bool    Api.IPlayer.IsInactive => false;
+        string? Api.IPlayer.NickName   => PlayerProperties.TryGetValue((byte)255, out var n) ? n as string : null;
+        string? Api.IPlayer.Address    => EndPoint?.ToString();
+        bool    Api.IPlayer.IsV18      => V18;
+        System.Collections.Generic.IReadOnlyDictionary<object, object?> Api.IPlayer.Properties => PlayerProperties;
     }
 
-    public sealed class PhotonServer
+    public sealed partial class PhotonServer
     {
         private readonly ServerConfig _config;
         private readonly int[] _ports;
@@ -137,6 +148,7 @@ namespace PhotonServer
         public PhotonServer(ServerConfig config)
         {
             _config = config;
+            _hooks = new Api.HookRegistry((ctx, ex) => Log($"[Plugins] {ctx} threw: {ex.Message}"));
             _ports = config.Ports;
             // The game-server port the client redirects to is fixed by the SDK's
             // ServerPortOverrides (UDP GameServer = 27002), so advertise that.
@@ -154,6 +166,8 @@ namespace PhotonServer
                 Log("[Server] NOTE: PublicHost is loopback — set it to your public IP/DNS in " +
                     "config.json so remote clients can reach the game server after redirect.");
             StartRetransmitThread();
+            LoadPlugins();
+            StartConsoleThread();
 
             // One receive loop per bound socket; all funnel into the same handler
             // under the global lock.
@@ -218,6 +232,7 @@ namespace PhotonServer
                                 LeaveRoom(peer, willComeBack: true);
                                 _peers.Remove(peer.EndPoint);
                                 CleanupSession(peer);
+                                _hooks.RaisePlayerDisconnected(peer);
                                 continue;
                             }
 
@@ -282,6 +297,7 @@ namespace PhotonServer
                             LeaveRoom(peer, willComeBack: true);
                             _peers.Remove(from);
                             CleanupSession(peer);
+                            _hooks.RaisePlayerDisconnected(peer);
                         }
                         break;
                     case CommandType.Ping:
@@ -541,12 +557,26 @@ namespace PhotonServer
                         break;
                     }
 
-                    peer.Authenticated = true;
-
                     // A client-supplied UserId (param 225) enables rejoin across
                     // reconnects; otherwise assign a stable one.
                     string? clientUserId = msg.Parameters.TryGetValue(Param.UserId, out var uid) && uid is string uids && uids.Length > 0
                         ? uids : null;
+
+                    // Plugin gate: blacklist / protocol-restriction mods can reject
+                    // the connection here (IP, UserId and protocol are all known).
+                    string? authAppId = msg.Parameters.TryGetValue(Param.AppId, out var aidv) && aidv is string aidvs ? aidvs : null;
+                    string? authAppVer = msg.Parameters.TryGetValue(Param.AppVersion, out var avv) && avv is string avvs ? avvs : null;
+                    var authCtx = new Api.AuthContext(peer.EndPoint.ToString(), clientUserId, peer.V18, authAppId, authAppVer);
+                    _hooks.RaisePlayerAuthenticating(authCtx);
+                    if (authCtx.Cancel)
+                    {
+                        SendReliableMessage(peer, cmd.Channel, BuildOpResp(peer, OpCode.Authenticate,
+                            authCtx.ReturnCode, authCtx.Message ?? "Authentication rejected", null));
+                        Log($"[{peer.EndPoint}]   AUTH rejected by plugin ({authCtx.Message})");
+                        break;
+                    }
+
+                    peer.Authenticated = true;
 
                     // A token in [221] means the client is returning after a
                     // create/join redirect — resume that session in game mode.
@@ -583,6 +613,7 @@ namespace PhotonServer
                     SendReliableMessage(peer, cmd.Channel, resp);
                     SendReliableMessage(peer, cmd.Channel, BuildGameListEvent(peer));
                     Log($"[{peer.EndPoint}]   JOIN LOBBY ok ({_rooms.Count} room(s) listed)");
+                    _hooks.RaiseLobbyJoined(peer);
                     break;
                 }
                 case OpCode.CreateGame:  HandleCreateGame(peer, cmd, msg); break;
@@ -631,6 +662,31 @@ namespace PhotonServer
 
             if (RedirectIfMaster(peer, cmd, OpCode.CreateGame, name, isCreate: true)) return;
 
+            var room = new Room(name);
+            ApplyRoomOptions(room, msg);
+
+            // Plugin gate: naming-convention / property mods may reject the create
+            // (with a client-facing error code) or rewrite the name / limits / props.
+            var createCtx = new Api.RoomCreateContext(peer, name, room.MaxPlayers, room.IsOpen, room.IsVisible, room.Properties);
+            _hooks.RaiseRoomCreating(createCtx);
+            if (createCtx.Cancel)
+            {
+                SendReliableMessage(peer, cmd.Channel, BuildOpResp(peer, OpCode.CreateGame,
+                    createCtx.ReturnCode, createCtx.Message ?? "Room rejected", null));
+                Log($"[{peer.EndPoint}]   CREATE '{name}' rejected by plugin ({createCtx.Message})");
+                return;
+            }
+            // Apply any rewrites, keeping the well-known props in sync so the
+            // enter-room response and game list reflect the final values.
+            name = createCtx.Name;
+            room.Name       = name;
+            room.MaxPlayers = createCtx.MaxPlayers;
+            room.IsOpen     = createCtx.IsOpen;
+            room.IsVisible  = createCtx.IsVisible;
+            room.Properties[(byte)255] = room.MaxPlayers;
+            room.Properties[(byte)253] = room.IsOpen;
+            room.Properties[(byte)254] = room.IsVisible;
+
             if (_rooms.ContainsKey(name))
             {
                 // Room exists → error (game already exists = 32766).
@@ -647,9 +703,6 @@ namespace PhotonServer
                 return;
             }
 
-            var room = new Room(name);
-            ApplyRoomOptions(room, msg);
-
             // Reject creation if the requested MaxPlayers exceeds the server's
             // per-room cap.
             if (_config.MaxPeersPerRoom > 0 && room.MaxPlayers > _config.MaxPeersPerRoom)
@@ -662,6 +715,7 @@ namespace PhotonServer
 
             _rooms[name] = room;
             EnterRoom(peer, room, msg, OpCode.CreateGame);
+            _hooks.RaiseRoomCreated(room);
             Log($"[{peer.EndPoint}]   CREATE '{name}' ok (actor {peer.ActorNr}, master)");
         }
 
@@ -681,6 +735,7 @@ namespace PhotonServer
                     room = new Room(name);
                     ApplyRoomOptions(room, msg);
                     _rooms[name] = room;
+                    _hooks.RaiseRoomCreated(room);
                 }
                 else
                 {
@@ -697,7 +752,19 @@ namespace PhotonServer
                     BuildOpResp(peer, OpCode.JoinGame, 32764, "Game closed", null));
                 return;
             }
-            if (RoomIsFull(room))
+
+            // Plugin gate: a join can be rejected, or waved past the capacity limit
+            // (e.g. a whitelisted IP allowed into an otherwise-full room).
+            var joinCtx = new Api.JoinContext(peer, room);
+            _hooks.RaisePlayerJoining(joinCtx);
+            if (joinCtx.Cancel)
+            {
+                SendReliableMessage(peer, cmd.Channel, BuildOpResp(peer, OpCode.JoinGame,
+                    joinCtx.ReturnCode, joinCtx.Message ?? "Join rejected", null));
+                Log($"[{peer.EndPoint}]   JOIN '{name}' rejected by plugin ({joinCtx.Message})");
+                return;
+            }
+            if (!joinCtx.AllowOverCapacity && RoomIsFull(room))
             {
                 SendReliableMessage(peer, cmd.Channel,
                     BuildOpResp(peer, OpCode.JoinGame, 32765, "Game full", null));
@@ -822,6 +889,8 @@ namespace PhotonServer
                 [Param.PlayerProperties] = ToDict(peer.PlayerProperties),
             }, exceptActor: actorNr);
             if (rejoin) Log($"[{peer.EndPoint}]   REJOINED as actor {actorNr}");
+
+            _hooks.RaisePlayerJoined(room, self);
         }
 
         private void HandleLeaveOp(Peer peer, PhotonCommand cmd, PhotonMessage msg)
@@ -858,6 +927,8 @@ namespace PhotonServer
                     room.EventCache.RemoveAll(ce => ce.Sender == actorNr && !ce.Global);
             }
 
+            _hooks.RaisePlayerLeft(room, peer);
+
             peer.Room = null;
             peer.ActorNr = 0;
 
@@ -879,10 +950,7 @@ namespace PhotonServer
                 $"(actor {actorNr}); {room.PlayerCount} member(s)");
 
             if (room.PlayerCount == 0)
-            {
-                _rooms.Remove(room.Name);
-                Log($"[Server]   room '{room.Name}' empty → removed");
-            }
+                DestroyRoom(room, "empty");
         }
 
         // Remove inactive actors whose PlayerTtl has elapsed, broadcasting a final
@@ -914,10 +982,7 @@ namespace PhotonServer
                     Log($"[Server]   inactive actor {actorNr} in '{room.Name}' TTL-expired → removed");
                 }
                 if (room.PlayerCount == 0)
-                {
-                    _rooms.Remove(room.Name);
-                    Log($"[Server]   room '{room.Name}' empty → removed");
-                }
+                    DestroyRoom(room, "empty");
             }
         }
 
@@ -949,6 +1014,14 @@ namespace PhotonServer
             object? data = msg.Parameters.TryGetValue(Param.Data, out var d) ? d : null;
             byte group = msg.Parameters.TryGetValue(Param.ReceiverGroup, out var rg) && rg is byte g ? g : ReceiverGroup.Others;
             byte cache = msg.Parameters.TryGetValue(Param.Cache, out var ca) && ca is byte cb ? cb : EventCaching.DoNotCache;
+
+            // Plugin gate: anti-cheat / protocol mods may drop or rewrite the event
+            // before it is cached or routed.
+            var raiseCtx = new Api.RaiseEventContext(room, peer, evCode, data, group);
+            _hooks.RaiseEventRaising(raiseCtx);
+            if (raiseCtx.Cancel) { LogV($"[{peer.EndPoint}]   RAISE ev={evCode} dropped by plugin"); return; }
+            evCode = raiseCtx.EventCode;
+            data   = raiseCtx.Data;
 
             // Cache maintenance. Add-to-cache events are also broadcast live;
             // remove-from-cache events only prune the buffer (no broadcast).
@@ -999,6 +1072,7 @@ namespace PhotonServer
                 }
             }
             LogV($"[{peer.EndPoint}]   RAISE ev={evCode} group={group} → routed");
+            _hooks.RaiseEventRaised(raiseCtx);
         }
 
         private void HandleSetProperties(Peer peer, PhotonCommand cmd, PhotonMessage msg)
@@ -1015,6 +1089,35 @@ namespace PhotonServer
             // (outfit/ready/nickname) under the room instead of the actor.
             int target = msg.Parameters.TryGetValue(Param.ActorNr, out var t) && t != null
                 ? Convert.ToInt32(t) : 0;
+
+            // Plugin gate: moderation mods can reject or rewrite a property set.
+            var propsCtx = new Api.PropertiesContext(room, peer, target, changed);
+            _hooks.RaisePropertiesChanging(propsCtx);
+            if (propsCtx.Cancel)
+            {
+                SendReliableMessage(peer, cmd.Channel, BuildOpResp(peer, OpCode.SetProperties,
+                    propsCtx.ReturnCode, propsCtx.Message ?? "Properties rejected", null));
+                Log($"[{peer.EndPoint}]   SETPROPS rejected by plugin ({propsCtx.Message})");
+                return;
+            }
+
+            // Dedicated nickname gate (player property 255): username-moderation
+            // mods get the old/new nick and may reject or sanitize it.
+            if (target != 0 && changed.TryGetValue((byte)255, out var nv) && nv is string newNick
+                && room.Members.TryGetValue(target, out var nickMember))
+            {
+                string? oldNick = nickMember.Properties.TryGetValue((byte)255, out var on) ? on as string : null;
+                var nickCtx = new Api.NickNameContext(room, nickMember, oldNick, newNick);
+                _hooks.RaiseNickNameChanging(nickCtx);
+                if (nickCtx.Cancel)
+                {
+                    SendReliableMessage(peer, cmd.Channel, BuildOpResp(peer, OpCode.SetProperties,
+                        nickCtx.ReturnCode, nickCtx.Message ?? "Nickname rejected", null));
+                    Log($"[{peer.EndPoint}]   NICKNAME '{newNick}' rejected by plugin ({nickCtx.Message})");
+                    return;
+                }
+                changed[(byte)255] = nickCtx.NewNick; // apply any sanitization
+            }
 
             if (target == 0) // room properties
             {
@@ -1248,8 +1351,27 @@ namespace PhotonServer
         private static string Hex(byte[] b, int len) =>
             BitConverter.ToString(b, 0, Math.Min(len, b.Length)).Replace("-", "");
 
-        private static void Log(string msg) =>
-            Console.WriteLine($"{DateTime.Now:HH:mm:ss.fff} {msg}");
+        // Console log, with optional suspension so a plugin can draw an interactive
+        // UI without server chatter interleaving. Suspended lines are buffered
+        // (capped) and flushed on ResumeLog. Guarded by its own lock since it is
+        // written from handler threads (under _sync) and the console-key thread.
+        private readonly object _logSync = new();
+        private bool _logSuspended;
+        private readonly List<string> _logBuffer = new();
+
+        private void Log(string msg)
+        {
+            string line = $"{DateTime.Now:HH:mm:ss.fff} {msg}";
+            lock (_logSync)
+            {
+                if (_logSuspended)
+                {
+                    if (_logBuffer.Count < 5000) _logBuffer.Add(line);
+                    return;
+                }
+            }
+            Console.WriteLine(line);
+        }
 
         // Verbose per-packet/per-op logging, gated by config.
         private void LogV(string msg)

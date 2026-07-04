@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>PhotonServer.Api</RootNamespace>
+    <AssemblyName>PhotonServer.Api</AssemblyName>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- This assembly is the stable contract shared by the server host and every
+         plugin DLL. It contains only interfaces + hook context POCOs; no server
+         internals. -->
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+
+</Project>

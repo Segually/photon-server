@@ -47,6 +47,14 @@ namespace PhotonServer
         /// higher-throughput hosting.</summary>
         public bool VerboseLogging { get; set; } = true;
 
+        /// <summary>Load plugin DLLs from <see cref="PluginsDirectory"/> at startup.</summary>
+        public bool EnablePlugins { get; set; } = true;
+
+        /// <summary>Directory scanned for plugin *.dll files on boot. A relative
+        /// value is resolved next to the server executable (and created on first
+        /// run if absent); an absolute path is used as-is.</summary>
+        public string PluginsDirectory { get; set; } = "plugins";
+
         // ── Load / create ────────────────────────────────────────────────────
         public static ServerConfig Load(string path)
         {

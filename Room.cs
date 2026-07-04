@@ -1,12 +1,15 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using PhotonServer.Api;
 
 namespace PhotonServer
 {
     // A room (Photon "game") and its actors. All access is serialized by the
-    // server's global lock, so no internal locking here.
-    public sealed class Room
+    // server's global lock, so no internal locking here. Implements the read-only
+    // IRoom view exposed to plugins (explicit implementations so the plugin-facing
+    // surface stays separate from the fields the server mutates directly).
+    public sealed class Room : IRoom
     {
         public string Name;
         public int    MaxPlayers;
@@ -66,9 +69,20 @@ namespace PhotonServer
         public RoomMember? FindInactiveByUserId(string? userId) =>
             userId == null ? null
                 : Members.Values.FirstOrDefault(m => m.IsInactive && m.UserId == userId);
+
+        // ── IRoom (plugin-facing read-only view) ─────────────────────────────
+        string IRoom.Name       => Name;
+        int    IRoom.MaxPlayers => MaxPlayers;
+        bool   IRoom.IsOpen     => IsOpen;
+        bool   IRoom.IsVisible  => IsVisible;
+        int    IRoom.MasterActor => MasterClientActor;
+        int    IRoom.PlayerCount => PlayerCount;
+        IReadOnlyDictionary<object, object?> IRoom.Properties => Properties;
+        IReadOnlyList<IPlayer> IRoom.Players =>
+            Members.Values.OrderBy(m => m.ActorNr).Cast<IPlayer>().ToList();
     }
 
-    public sealed class RoomMember
+    public sealed class RoomMember : IPlayer
     {
         public int     ActorNr;
         public Peer    Peer = null!;
@@ -76,6 +90,15 @@ namespace PhotonServer
         public bool    IsInactive;
         public long    DeactivatedMs;
         public readonly Dictionary<object, object?> Properties = new();
+
+        // ── IPlayer (plugin-facing read-only view) ───────────────────────────
+        int     IPlayer.ActorNr    => ActorNr;
+        string? IPlayer.UserId     => UserId;
+        bool    IPlayer.IsInactive => IsInactive;
+        string? IPlayer.NickName   => Properties.TryGetValue((byte)255, out var n) ? n as string : null;
+        string? IPlayer.Address    => Peer?.EndPoint?.ToString();
+        bool    IPlayer.IsV18      => Peer?.V18 ?? false;
+        IReadOnlyDictionary<object, object?> IPlayer.Properties => Properties;
     }
 
     // A cached room event awaiting replay to future joiners.

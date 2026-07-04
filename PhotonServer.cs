@@ -830,6 +830,7 @@ namespace PhotonServer
             var room = peer.Room;
             if (room == null) return;
             int actorNr = peer.ActorNr;
+            int oldMaster = room.MasterClientActor;
 
             bool goInactive = willComeBack && room.PlayerTtl != 0 && room.Members.ContainsKey(actorNr);
             if (goInactive)
@@ -850,13 +851,20 @@ namespace PhotonServer
             peer.Room = null;
             peer.ActorNr = 0;
 
-            BroadcastEvent(room, EvCode.Leave, new Dictionary<byte, object?>
+            var leaveParams = new Dictionary<byte, object?>
             {
-                [Param.ActorNr]        = actorNr,
-                [Param.ActorList]      = room.ActorNumbers,
-                [Param.MasterClientId] = room.MasterClientActor,
-                [Param.IsInactive]     = goInactive,
-            });
+                [Param.ActorNr]    = actorNr,
+                [Param.ActorList]  = room.ActorNumbers,
+                [Param.IsInactive] = goInactive,
+            };
+            // Only advertise a new master when it actually changed: the client fires
+            // OnMasterClientSwitched unconditionally whenever this param is present
+            // (it does not compare against the current master), so always sending it
+            // would spuriously re-fire the callback on every player's departure.
+            if (room.MasterClientActor != oldMaster && room.MasterClientActor != 0)
+                leaveParams[Param.MasterClientId] = room.MasterClientActor;
+
+            BroadcastEvent(room, EvCode.Leave, leaveParams);
             Log($"[{peer.EndPoint}]   {(goInactive ? "INACTIVE in" : "LEFT")} room '{room.Name}' " +
                 $"(actor {actorNr}); {room.PlayerCount} member(s)");
 
@@ -879,16 +887,20 @@ namespace PhotonServer
                     .Select(m => m.ActorNr).ToList();
                 foreach (var actorNr in expired)
                 {
+                    int oldMaster = room.MasterClientActor;
                     room.RemoveMember(actorNr);
                     if (room.CleanupCacheOnLeave)
                         room.EventCache.RemoveAll(ce => ce.Sender == actorNr && !ce.Global);
-                    BroadcastEvent(room, EvCode.Leave, new Dictionary<byte, object?>
+                    var leaveParams = new Dictionary<byte, object?>
                     {
-                        [Param.ActorNr]        = actorNr,
-                        [Param.ActorList]      = room.ActorNumbers,
-                        [Param.MasterClientId] = room.MasterClientActor,
-                        [Param.IsInactive]     = false,
-                    });
+                        [Param.ActorNr]    = actorNr,
+                        [Param.ActorList]  = room.ActorNumbers,
+                        [Param.IsInactive] = false,
+                    };
+                    // Only signal a master change when it actually changed (see LeaveRoom).
+                    if (room.MasterClientActor != oldMaster && room.MasterClientActor != 0)
+                        leaveParams[Param.MasterClientId] = room.MasterClientActor;
+                    BroadcastEvent(room, EvCode.Leave, leaveParams);
                     Log($"[Server]   inactive actor {actorNr} in '{room.Name}' TTL-expired → removed");
                 }
                 if (room.PlayerCount == 0)

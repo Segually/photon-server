@@ -998,7 +998,13 @@ namespace PhotonServer
 
             var changed = msg.Parameters.TryGetValue(Param.Properties, out var p) && p is Dictionary<object, object?> pd
                 ? pd : new Dictionary<object, object?>();
-            int target = msg.Parameters.TryGetValue(Param.TargetActorNr, out var t) && t is int ti ? ti : 0;
+            // In the SetProperties OPERATION the target actor is param 254 (ActorNr);
+            // absent/0 means room properties. (Param 253 in the op is ExpectedValues
+            // for CAS, NOT the target — 253 is only the target in the outgoing EVENT.)
+            // Reading the target from 253 silently filed every player-property set
+            // (outfit/ready/nickname) under the room instead of the actor.
+            int target = msg.Parameters.TryGetValue(Param.ActorNr, out var t) && t != null
+                ? Convert.ToInt32(t) : 0;
 
             if (target == 0) // room properties
             {
@@ -1011,13 +1017,16 @@ namespace PhotonServer
 
             SendReliableMessage(peer, cmd.Channel, BuildOpResp(peer, OpCode.SetProperties, 0, null, null));
 
-            // Broadcast the change to everyone (Event 253).
+            // Broadcast the change to everyone INCLUDING the setter: the real server
+            // echoes property changes back to the actor that made them (verified
+            // against Photon Cloud), and clients rely on that event to apply the
+            // change — so excluding the sender leaves its own state/UI unupdated.
             BroadcastEvent(room, EvCode.PropertiesChanged, new Dictionary<byte, object?>
             {
                 [Param.Properties]    = changed,
                 [Param.TargetActorNr] = target,
                 [Param.ActorNr]       = peer.ActorNr,
-            }, exceptActor: peer.ActorNr);
+            });
             Log($"[{peer.EndPoint}]   SETPROPS target={(target == 0 ? "room" : target.ToString())} → broadcast");
         }
 

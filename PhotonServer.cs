@@ -75,6 +75,7 @@ namespace PhotonServer
         public sealed class Unacked
         {
             public byte[] CommandBytes = null!;
+            public long   FirstSentMs;
             public long   LastSentMs;
             public int    Retries;
         }
@@ -139,7 +140,11 @@ namespace PhotonServer
 
         // Retransmission tuning.
         private const int RetransmitMs = 200;
-        private const int MaxRetries   = 12;
+        // A reliable command that stays unACKed this many times AND for longer
+        // than UnackedDropMs means the client is gone (Photon does the same:
+        // sentCountAllowance + disconnect timeout).
+        private const int MaxRetries     = 7;
+        private const int UnackedDropMs  = 6000;
 
         // The server always sends packets with peer id 0x0000 in the header
         // (observed on the wire).
@@ -225,35 +230,51 @@ namespace PhotonServer
                         foreach (var peer in _peers.Values.ToList())
                         {
                             // Idle-timeout sweep: drop peers that have gone silent
-                            // (crashed clients that never sent a Disconnect).
+                            // (crashed clients, lost network, killed apps).
                             if (_config.PeerTimeoutMs > 0 && now - peer.LastRecvMs > _config.PeerTimeoutMs)
                             {
-                                Log($"[{peer.EndPoint}] idle timeout ({now - peer.LastRecvMs}ms) — dropping");
-                                LeaveRoom(peer, willComeBack: true);
-                                _peers.Remove(peer.EndPoint);
-                                CleanupSession(peer);
-                                _hooks.RaisePlayerDisconnected(peer);
+                                DropPeer(peer, $"idle timeout ({now - peer.LastRecvMs}ms)");
                                 continue;
                             }
 
+                            bool dead = false;
                             foreach (var kv in peer.UnackedCommands.ToList())
                             {
                                 var u = kv.Value;
-                                if (now - u.LastSentMs < RetransmitMs) continue;
-                                if (u.Retries >= MaxRetries)
+                                if (u.Retries >= MaxRetries && now - u.FirstSentMs > UnackedDropMs)
                                 {
-                                    peer.UnackedCommands.Remove(kv.Key);
-                                    continue;
+                                    dead = true;
+                                    break;
                                 }
+                                // Back off a little so a dead peer isn't flooded, but
+                                // keep retrying until it is declared dead.
+                                int interval = Math.Min(RetransmitMs << Math.Min(u.Retries / 3, 2), 800);
+                                if (now - u.LastSentMs < interval) continue;
                                 u.Retries++;
                                 u.LastSentMs = now;
                                 SendPacket(peer, new[] { u.CommandBytes });
                             }
+                            if (dead)
+                                DropPeer(peer, "reliable command never ACKed (peer unreachable)");
                         }
                     }
                 }
             }) { IsBackground = true, Name = "Retransmit" };
             t.Start();
+        }
+
+        // Single teardown path for a peer: client Disconnect, idle timeout and
+        // unreachable-peer detection all go through here. Caller holds _sync.
+        private void DropPeer(Peer peer, string? reason)
+        {
+            // Ignore if already removed (e.g. timeout racing a Disconnect).
+            if (!_peers.TryGetValue(peer.EndPoint, out var cur) || !ReferenceEquals(cur, peer)) return;
+            if (reason != null) Log($"[{peer.EndPoint}] {reason} — dropping");
+            peer.UnackedCommands.Clear();
+            LeaveRoom(peer, willComeBack: true);
+            _peers.Remove(peer.EndPoint);
+            CleanupSession(peer);
+            _hooks.RaisePlayerDisconnected(peer);
         }
 
         // ── Datagram dispatch ────────────────────────────────────────────────
@@ -294,10 +315,7 @@ namespace PhotonServer
                         {
                             // A clean disconnect may still leave an inactive actor
                             // if the room has a PlayerTtl (the client can rejoin).
-                            LeaveRoom(peer, willComeBack: true);
-                            _peers.Remove(from);
-                            CleanupSession(peer);
-                            _hooks.RaisePlayerDisconnected(peer);
+                            DropPeer(peer, null);
                         }
                         break;
                     case CommandType.Ping:
@@ -325,6 +343,12 @@ namespace PhotonServer
         // ── Connection handshake ─────────────────────────────────────────────
         private Peer HandleConnect(PhotonPacket pkt, PhotonCommand cmd, IPEndPoint from, UdpClient sock)
         {
+            // A fresh Connect from an endpoint we still track means the old
+            // connection died without us noticing (app killed + restarted on the
+            // same port). Tear it down so it doesn't linger as a ghost in a room.
+            if (_peers.TryGetValue(from, out var stale))
+                DropPeer(stale, "reconnect from same endpoint, replacing stale peer");
+
             ushort assignedId = _nextPeerId++;
             var peer = new Peer(from, sock, assignedId, pkt.Challenge) { LastRecvMs = NowMs };
             _peers[from] = peer;
@@ -1271,7 +1295,7 @@ namespace PhotonServer
         private void RegisterAndSend(Peer peer, byte channel, int seq, byte[] cmdBytes)
         {
             long key = ((long)channel << 32) | (uint)seq;
-            peer.UnackedCommands[key] = new Peer.Unacked { CommandBytes = cmdBytes, LastSentMs = NowMs };
+            peer.UnackedCommands[key] = new Peer.Unacked { CommandBytes = cmdBytes, FirstSentMs = NowMs, LastSentMs = NowMs };
             SendPacket(peer, new[] { cmdBytes });
         }
 

@@ -14,6 +14,8 @@ namespace PhotonServer
         public const byte GetProperties  = 251;
         public const byte ChangeGroups   = 248;
         public const byte Authenticate   = 230;
+        public const byte GetRegions     = 220; // NameServer
+        public const byte AuthenticateOnce = 231; // PUN2 AuthMode.AuthOnce
     }
 
     // Photon event codes (server → client).
@@ -31,6 +33,8 @@ namespace PhotonServer
     public static class Param
     {
         public const byte Address          = 230;
+        public const byte JoinMode         = 215; // 0 = Default, 1 = CreateIfNotExists, 2 = JoinOrRejoin, 3 = RejoinOnly (verified: Stumble Guys JoinMode enum)
+        public const byte Region           = 210; // GetRegions: region codes (string[])
         public const byte GameId           = 255; // room name
         public const byte ActorNr          = 254;
         public const byte TargetActorNr    = 253;

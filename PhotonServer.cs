@@ -559,6 +559,7 @@ namespace PhotonServer
             switch (msg.Code)
             {
                 case OpCode.Authenticate:
+                case OpCode.AuthenticateOnce:   // PUN2 AuthMode.AuthOnce: same request shape, op 231
                 {
                     // Optional AppId / AppVersion gating (only present on the first,
                     // master-side auth; the game-server re-auth carries only a token).
@@ -567,7 +568,7 @@ namespace PhotonServer
                         aids != _config.RequireAppId)
                     {
                         SendReliableMessage(peer, cmd.Channel,
-                            BuildOpResp(peer, OpCode.Authenticate, 32755, "Invalid AppId", null));
+                            BuildOpResp(peer, msg.Code, 32755, "Invalid AppId", null));
                         Log($"[{peer.EndPoint}]   AUTH rejected (AppId '{aids}')");
                         break;
                     }
@@ -576,7 +577,7 @@ namespace PhotonServer
                         avs != _config.RequireAppVersion)
                     {
                         SendReliableMessage(peer, cmd.Channel,
-                            BuildOpResp(peer, OpCode.Authenticate, 32755, "Invalid AppVersion", null));
+                            BuildOpResp(peer, msg.Code, 32755, "Invalid AppVersion", null));
                         Log($"[{peer.EndPoint}]   AUTH rejected (AppVersion '{avs}')");
                         break;
                     }
@@ -594,7 +595,7 @@ namespace PhotonServer
                     _hooks.RaisePlayerAuthenticating(authCtx);
                     if (authCtx.Cancel)
                     {
-                        SendReliableMessage(peer, cmd.Channel, BuildOpResp(peer, OpCode.Authenticate,
+                        SendReliableMessage(peer, cmd.Channel, BuildOpResp(peer, msg.Code,
                             authCtx.ReturnCode, authCtx.Message ?? "Authentication rejected", null));
                         Log($"[{peer.EndPoint}]   AUTH rejected by plugin ({authCtx.Message})");
                         break;
@@ -622,12 +623,20 @@ namespace PhotonServer
                         Log($"[{peer.EndPoint}]   AUTH ok (MASTER mode, user {peer.UserId})");
                     }
 
-                    var resp = BuildOpResp(peer, OpCode.Authenticate, 0, null,
-                        new Dictionary<byte, object?>
-                        {
-                            [Param.Secret] = peer.SessionToken,
-                            [Param.UserId] = peer.UserId,
-                        });
+                    var authResp = new Dictionary<byte, object?>
+                    {
+                        [Param.Secret] = peer.SessionToken,
+                        [Param.UserId] = peer.UserId,
+                    };
+                    // NameServer hop (client: ConnectToRegionMaster → OpAuthenticate with the
+                    // chosen region in param 210): the client reads Address (230) as the master
+                    // server to connect to next. Master/game-server auths carry no region.
+                    if (!peer.GameMode && msg.Parameters.TryGetValue(Param.Region, out var rg) && rg is string rgs && rgs.Length > 0)
+                    {
+                        authResp[Param.Address] = MasterAddress;
+                        Log($"[{peer.EndPoint}]   NAMESERVER auth, region '{rgs}' → master {MasterAddress}");
+                    }
+                    var resp = BuildOpResp(peer, msg.Code, 0, null, authResp);
                     SendReliableMessage(peer, cmd.Channel, resp);
                     break;
                 }
@@ -641,7 +650,24 @@ namespace PhotonServer
                     break;
                 }
                 case OpCode.CreateGame:  HandleCreateGame(peer, cmd, msg); break;
-                case OpCode.JoinGame:    HandleJoinGame(peer, cmd, msg, createIfAbsent: false); break;
+                case OpCode.JoinGame:
+                    // JoinMode 1 = CreateIfNotExists (PUN JoinOrCreateRoom, Photon Voice rooms).
+                    HandleJoinGame(peer, cmd, msg, createIfAbsent:
+                        msg.Parameters.TryGetValue(Param.JoinMode, out var jm) && Convert.ToInt32(jm) == 1);
+                    break;
+                case OpCode.GetRegions:
+                {
+                    string region = string.IsNullOrEmpty(_config.Region) ? "eu" : _config.Region;
+                    string master = MasterAddress;
+                    SendReliableMessage(peer, cmd.Channel, BuildOpResp(peer, OpCode.GetRegions, 0, null,
+                        new Dictionary<byte, object?>
+                        {
+                            [Param.Region]  = new[] { region },
+                            [Param.Address] = new[] { master },
+                        }));
+                    Log($"[{peer.EndPoint}]   GET REGIONS → {region} @ {master}");
+                    break;
+                }
                 case OpCode.JoinRandomGame: HandleJoinRandom(peer, cmd, msg); break;
                 case OpCode.RaiseEvent:  HandleRaiseEvent(peer, cmd, msg); break;
                 case OpCode.SetProperties: HandleSetProperties(peer, cmd, msg); break;
@@ -656,6 +682,10 @@ namespace PhotonServer
         }
 
         // ── Room operations ──────────────────────────────────────────────────
+
+        // Master-server address handed to clients (GetRegions / NameServer auth). 27001 is the
+        // master port by convention (27000 = name server, 27002 = game server).
+        private string MasterAddress => $"{_config.PublicHost}:{(_ports.Contains(27001) ? 27001 : _ports[0])}";
 
         // On the master, create/join don't enter a room — they hand the client a
         // game-server address (ourselves) plus its session token, and the client
@@ -747,7 +777,7 @@ namespace PhotonServer
         {
             string name = msg.Parameters.TryGetValue(Param.GameId, out var g) && g is string s ? s : (peer.PendingRoom ?? "");
 
-            if (RedirectIfMaster(peer, cmd, OpCode.JoinGame, name, isCreate: false)) return;
+            if (RedirectIfMaster(peer, cmd, OpCode.JoinGame, name, isCreate: createIfAbsent)) return;
 
             // In game mode a create-turned-join (room already made by us) still enters.
             if (peer.PendingCreate) createIfAbsent = true;
